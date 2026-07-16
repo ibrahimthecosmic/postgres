@@ -5,6 +5,8 @@ export default function Subscribe(postgres, options) {
   const subscribers = new Map()
       , slot = 'postgresjs_' + Math.random().toString(36).slice(2)
       , state = {}
+      , hwm = options.subscribe_high_water_mark || 1024
+      , lwm = Math.ceil(hwm / 4)
 
   let connection
     , stream
@@ -88,18 +90,30 @@ export default function Subscribe(postgres, options) {
 
     const [x] = xs
 
+    const v2 = parseInt(sql.parameters.server_version) >= 14
+
     const stream = await sql.unsafe(
       `START_REPLICATION SLOT ${ slot } LOGICAL ${
         x.consistent_point
-      } (proto_version '1', publication_names '${ publications }')`
+      } (proto_version '${ v2 ? '2' : '1' }', publication_names '${ publications }'${ v2 ? ', streaming \'on\'' : '' })`
     ).writable()
 
     const state = {
       lsn: Buffer.concat(x.consistent_point.split('/').map(x => Buffer.from(('00000000' + x).slice(-8), 'hex')))
     }
 
+    const live = new Set()
+        , txs = new Map()
+
+    let tx = null
+      , begun = null
+      , queued = 0
+      , paused = false
+      , heartbeat = null
+
     stream.on('data', data)
     stream.on('error', error)
+    stream.on('close', teardown)
     stream.on('close', sql.close)
 
     return { stream, state: xs.state }
@@ -118,6 +132,60 @@ export default function Subscribe(postgres, options) {
     }
 
     function handle(a, b) {
+      b.command === 'begin' ? begin(b)
+        : b.command === 'commit' ? commit(b)
+        : b.command === 'stream_commit' ? streamCommit(b)
+        : b.command === 'stream_abort' ? streamAbort(b)
+        : state.stream ? streamed(a, b)
+        : row(a, b)
+    }
+
+    function begin(b) {
+      begun = { xid: b.xid, streaming: false, lsn: null, date: null }
+      tx = null
+    }
+
+    function commit(b) {
+      tx && (tx.info.lsn = b.lsn, tx.info.date = b.date, tx.end())
+      tx = begun = null
+    }
+
+    function streamCommit(b) {
+      const t = txs.get(b.xid)
+      txs.delete(b.xid)
+      t && (t.info.lsn = b.lsn, t.info.date = b.date, t.end())
+    }
+
+    function streamAbort(b) {
+      if (b.subxid === b.xid) {
+        const t = txs.get(b.xid)
+        txs.delete(b.xid)
+        t && t.error(Object.assign(new Error('Transaction ' + b.xid + ' aborted'), { xid: b.xid }))
+      } else {
+        const t = txs.get(b.xid)
+        t && t.push({ command: 'abort', xid: b.subxid })
+      }
+    }
+
+    function streamed(a, b) {
+      let t = txs.get(state.stream)
+      t === undefined && txs.set(state.stream, t = transaction({ xid: state.stream, streaming: true, lsn: null, date: null }))
+      t && t.push(change(a, b))
+    }
+
+    function row(a, b) {
+      dispatch(a, b)
+      if (begun) {
+        tx === null && (tx = transaction(begun))
+        tx && tx.push(change(a, b))
+      }
+    }
+
+    function change(a, b) {
+      return { command: b.command, row: a, old: b.old || null, relation: b.relation, xid: b.xid }
+    }
+
+    function dispatch(a, b) {
       const path = b.relation.schema + '.' + b.relation.table
       call('*', a, b)
       call('*:' + path, a, b)
@@ -125,6 +193,139 @@ export default function Subscribe(postgres, options) {
       call(b.command, a, b)
       call(b.command + ':' + path, a, b)
       b.relation.keys.length && call(b.command + ':' + path + '=' + b.relation.keys.map(x => a[x.name]), a, b)
+    }
+
+    function transaction(info) {
+      const fns = subscribers.get('transaction')
+      if (!fns || fns.size === 0)
+        return false
+
+      const t = {
+        info,
+        iterators: [],
+        push: x => t.iterators.forEach(it => it.push(x)),
+        end: () => (live.delete(t), t.iterators.forEach(it => it.end())),
+        error: e => (live.delete(t), t.iterators.forEach(it => it.error(e)))
+      }
+
+      fns.forEach(({ fn }) => {
+        const it = Changes()
+        t.iterators.push(it)
+        try {
+          const x = fn(it.changes, info, 'transaction')
+          x && typeof x.catch === 'function' && x.catch(error)
+        } catch (e) {
+          error(e)
+        }
+      })
+
+      live.add(t)
+      return t
+    }
+
+    function Changes() {
+      const queue = []
+
+      let pending = null
+        , done = false
+        , failed = null
+
+      return { push, end, error, changes: { [Symbol.asyncIterator]: () => ({ next, return: finish, throw: finish }) } }
+
+      function push(x) {
+        if (done)
+          return
+        if (pending) {
+          const p = pending
+          pending = null
+          p.resolve({ done: false, value: x })
+        } else {
+          queue.push(x)
+          inc(1)
+        }
+      }
+
+      function end() {
+        if (done)
+          return
+        done = true
+        if (pending) {
+          const p = pending
+          pending = null
+          p.resolve({ done: true, value: undefined })
+        }
+      }
+
+      function error(e) {
+        if (done)
+          return
+        done = true
+        failed = e
+        dec(queue.length)
+        queue.length = 0
+        if (pending) {
+          const p = pending
+          pending = null
+          p.reject(e)
+        }
+      }
+
+      function next() {
+        if (queue.length) {
+          dec(1)
+          return Promise.resolve({ done: false, value: queue.shift() })
+        }
+        if (failed)
+          return Promise.reject(failed)
+        if (done)
+          return Promise.resolve({ done: true, value: undefined })
+        return new Promise((resolve, reject) => pending = { resolve, reject })
+      }
+
+      function finish() {
+        done = true
+        failed = null
+        dec(queue.length)
+        queue.length = 0
+        if (pending) {
+          const p = pending
+          pending = null
+          p.resolve({ done: true, value: undefined })
+        }
+        return Promise.resolve({ done: true, value: undefined })
+      }
+    }
+
+    function inc(n) {
+      queued += n
+      if (!paused && queued >= hwm) {
+        paused = true
+        stream.pause()
+        heartbeat = setInterval(() => stream && !stream.destroyed && pong(), 15000)
+        heartbeat.unref && heartbeat.unref()
+      }
+    }
+
+    function dec(n) {
+      queued -= n
+      if (paused && queued <= lwm) {
+        paused = false
+        clearInterval(heartbeat)
+        heartbeat = null
+        stream.destroyed || stream.resume()
+      }
+    }
+
+    function teardown() {
+      clearInterval(heartbeat)
+      heartbeat = null
+      paused = false
+      queued = 0
+      tx = begun = null
+      txs.clear()
+      const e = new Error('Subscription stream closed')
+      live.forEach(t => t.error(e))
+      live.clear()
     }
 
     function pong() {
@@ -145,12 +346,16 @@ function Time(x) {
   return new Date(Date.UTC(2000, 0, 1) + Number(x / BigInt(1000)))
 }
 
+function Lsn(x, i) {
+  return x.readUInt32BE(i).toString(16).toUpperCase() + '/' + x.readUInt32BE(i + 4).toString(16).toUpperCase()
+}
+
 function parse(x, state, parsers, handle, transform) {
   const char = (acc, [k, v]) => (acc[k.charCodeAt(0)] = v, acc)
 
   Object.entries({
     R: x => {  // Relation
-      let i = 1
+      let i = state.stream ? 5 : 1
       const r = state[x.readUInt32BE(i)] = {
         schema: x.toString('utf8', i += 4, i = x.indexOf(0, i)) || 'pg_catalog',
         table: x.toString('utf8', i + 1, i = x.indexOf(0, i + 1)),
@@ -182,19 +387,24 @@ function parse(x, state, parsers, handle, transform) {
     B: x => { // Begin
       state.date = Time(x.readBigInt64BE(9))
       state.lsn = x.subarray(1, 9)
+      state.xid = x.readUInt32BE(17)
+      handle(null, { command: 'begin', xid: state.xid })
     },
     I: x => { // Insert
-      let i = 1
+      let i = state.stream ? 5 : 1
+      const xid = state.stream ? x.readUInt32BE(1) : state.xid
       const relation = state[x.readUInt32BE(i)]
       const { row } = tuples(x, relation.columns, i += 7, transform)
 
       handle(row, {
         command: 'insert',
-        relation
+        relation,
+        xid
       })
     },
     D: x => { // Delete
-      let i = 1
+      let i = state.stream ? 5 : 1
+      const xid = state.stream ? x.readUInt32BE(1) : state.xid
       const relation = state[x.readUInt32BE(i)]
       i += 4
       const key = x[i] === 75
@@ -204,11 +414,13 @@ function parse(x, state, parsers, handle, transform) {
       , {
         command: 'delete',
         relation,
-        key
+        key,
+        xid
       })
     },
     U: x => { // Update
-      let i = 1
+      let i = state.stream ? 5 : 1
+      const xid = state.stream ? x.readUInt32BE(1) : state.xid
       const relation = state[x.readUInt32BE(i)]
       i += 4
       const key = x[i] === 75
@@ -224,11 +436,26 @@ function parse(x, state, parsers, handle, transform) {
         command: 'update',
         relation,
         key,
-        old: xs && xs.row
+        old: xs && xs.row,
+        xid
       })
     },
     T: () => { /* noop */ }, // Truncate,
-    C: () => { /* noop */ }  // Commit
+    S: x => { // Stream Start
+      state.stream = x.readUInt32BE(1)
+    },
+    E: () => { // Stream Stop
+      state.stream = null
+    },
+    c: x => { // Stream Commit
+      handle(null, { command: 'stream_commit', xid: x.readUInt32BE(1), lsn: Lsn(x, 6), date: Time(x.readBigInt64BE(22)) })
+    },
+    A: x => { // Stream Abort
+      handle(null, { command: 'stream_abort', xid: x.readUInt32BE(1), subxid: x.readUInt32BE(5) })
+    },
+    C: x => { // Commit
+      handle(null, { command: 'commit', lsn: Lsn(x, 2), date: Time(x.readBigInt64BE(18)) })
+    }
   }).reduce(char, {})[x[0]](x)
 }
 
@@ -265,6 +492,12 @@ function tuples(x, columns, xi, transform) {
 }
 
 function parseEvent(x) {
+  if (/^transaction/i.test(x)) {
+    if (!/^transaction$/i.test(x))
+      throw new Error('The transaction event does not support filters: ' + x)
+    return 'transaction'
+  }
+
   const xs = x.match(/^(\*|insert|update|delete)?:?([^.]+?\.?[^=]+)?=?(.+)?/i) || []
 
   if (!xs)

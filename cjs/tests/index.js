@@ -2184,6 +2184,187 @@ t('subscribe reconnects and calls onsubscribe', { timeout: 4 }, async() => {
   ]
 })
 
+t('subscribe transaction', { timeout: 5 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables'
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const result = []
+  let callbacks = 0
+    , info
+
+  const { unsubscribe } = await sql.subscribe('transaction', async(changes, x) => {
+    callbacks++
+    for await (const c of changes)
+      result.push(c.command, c.row && c.row.name)
+    info = x
+  })
+
+  await sql`
+    create table test (
+      id serial primary key,
+      name text
+    )
+  `
+
+  await sql.begin(async sql => {
+    await sql`insert into test (name) values ('Murray')`
+    await sql`update test set name = 'Rothbard'`
+    await sql`delete from test`
+  })
+  await delay(200)
+  await unsubscribe()
+  return [
+    '1,insert,Murray,update,Rothbard,delete,,false,string,true',
+    callbacks + ',' + result.join(',') + ',' + info.streaming + ',' + typeof info.lsn + ',' + (info.date instanceof Date),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe transaction streaming', { timeout: 10 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables'
+  })
+
+  const [{ v }] = await sql`select current_setting('server_version_num')::int as v`
+  if (v < 140000)
+    return ['skip', 'skip', await sql.end()]
+
+  await sql`alter system set logical_decoding_work_mem = '64kB'`
+  await sql`select pg_reload_conf()`
+  await delay(100)
+  await sql.unsafe('create publication alltables for all tables')
+  await sql`
+    create table test (
+      id serial primary key,
+      name text
+    )
+  `
+
+  let count = 0
+    , streaming = false
+    , lsn
+
+  const { unsubscribe } = await sql.subscribe('transaction', async(changes, info) => {
+    for await (const c of changes)
+      c.command === 'insert' && count++
+    streaming = info.streaming
+    lsn = info.lsn
+  })
+
+  await sql`insert into test (name) select repeat('x', 1000) from generate_series(1, 500)`
+  await delay(500)
+  await unsubscribe()
+  await sql`alter system reset logical_decoding_work_mem`
+  await sql`select pg_reload_conf()`
+  return [
+    'true 500 string',
+    streaming + ' ' + count + ' ' + typeof lsn,
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe transaction streamed abort rejects iterator', { timeout: 10 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables'
+  })
+
+  const [{ v }] = await sql`select current_setting('server_version_num')::int as v`
+  if (v < 140000)
+    return ['skip', 'skip', await sql.end()]
+
+  await sql`alter system set logical_decoding_work_mem = '64kB'`
+  await sql`select pg_reload_conf()`
+  await delay(100)
+  await sql.unsafe('create publication alltables for all tables')
+  await sql`
+    create table test (
+      id serial primary key,
+      name text
+    )
+  `
+
+  let error
+    , got = 0
+
+  const { unsubscribe } = await sql.subscribe('transaction', async changes => {
+    try {
+      for await (const c of changes)
+        c && got++
+    } catch (e) {
+      error = e
+    }
+  })
+
+  await sql.begin(async sql => {
+    await sql`insert into test (name) select repeat('x', 1000) from generate_series(1, 500)`
+    await delay(500)
+    throw new Error('rollback')
+  }).catch(() => { /* expected */ })
+  await delay(500)
+  await unsubscribe()
+  await sql`alter system reset logical_decoding_work_mem`
+  await sql`select pg_reload_conf()`
+  return [
+    'true',
+    '' + /aborted/.test(error && error.message),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe per-row events skip streamed transactions', { timeout: 10 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables'
+  })
+
+  const [{ v }] = await sql`select current_setting('server_version_num')::int as v`
+  if (v < 140000)
+    return ['skip', 'skip', await sql.end()]
+
+  await sql`alter system set logical_decoding_work_mem = '64kB'`
+  await sql`select pg_reload_conf()`
+  await delay(100)
+  await sql.unsafe('create publication alltables for all tables')
+  await sql`
+    create table test (
+      id serial primary key,
+      name text
+    )
+  `
+
+  const rows = []
+
+  const { unsubscribe } = await sql.subscribe('*', (row, { command }) => rows.push(command))
+
+  await sql`insert into test (name) select repeat('x', 1000) from generate_series(1, 500)`
+  await delay(500)
+  const afterStreamed = rows.length
+  await sql`insert into test (name) values ('after')`
+  await delay(200)
+  await unsubscribe()
+  await sql`alter system reset logical_decoding_work_mem`
+  await sql`select pg_reload_conf()`
+  return [
+    '0 insert',
+    afterStreamed + ' ' + rows.join(','),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
 t('Execute', async() => {
   const result = await new Promise((resolve) => {
     const sql = postgres({ ...options, fetch_types: false, debug:(id, query) => resolve(query) })

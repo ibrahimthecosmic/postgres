@@ -118,6 +118,12 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    * @default 'alltables'
    */
   publications: string
+  /**
+   * Max queued-but-unconsumed changes across live transaction iterators before the
+   * replication stream is paused (only relevant when calling `sql.subscribe('transaction')`)
+   * @default 1024
+   */
+  subscribe_high_water_mark: number
   onclose: (connId: number) => void;
   backoff: boolean | ((attemptNum: number) => number);
   max_lifetime: number | null;
@@ -494,6 +500,22 @@ declare namespace postgres {
     | { command: 'delete', relation: RelationInfo, key: boolean }
     | { command: 'update', relation: RelationInfo, key: boolean, old: Row | null };
 
+  type TransactionChange =
+    | { command: 'insert', row: Row, old: null, relation: RelationInfo, xid: number }
+    | { command: 'update', row: Row, old: Row | null, relation: RelationInfo, xid: number }
+    | { command: 'delete', row: Row | null, old: null, relation: RelationInfo, xid: number }
+    | { command: 'abort', xid: number };
+
+  interface TransactionInfo {
+    xid: number;
+    /** True when delivered via pgoutput streaming (large in-progress transaction, PG 14+) */
+    streaming: boolean;
+    /** Commit LSN as 'X/XXXXXXXX'; null until the transaction commits */
+    lsn: string | null;
+    /** Commit timestamp; null until the transaction commits */
+    date: Date | null;
+  }
+
   interface SubscriptionHandle {
     unsubscribe(): void;
   }
@@ -710,6 +732,7 @@ declare namespace postgres {
 
     listen(channel: string, onnotify: (value: string) => void, onlisten?: (() => void) | undefined): ListenRequest;
 
+    subscribe(event: 'transaction', cb: (changes: AsyncIterable<TransactionChange>, info: TransactionInfo) => void | Promise<void>, onsubscribe?: (() => void), onerror?: ((error: Error) => any)): Promise<SubscriptionHandle>;
     subscribe(event: string, cb: (row: Row | null, info: ReplicationEvent) => void, onsubscribe?: (() => void), onerror?: (() => any)): Promise<SubscriptionHandle>;
 
     largeObject(oid?: number | undefined, /** @default 0x00020000 | 0x00040000 */ mode?: number | undefined): Promise<LargeObject>;

@@ -916,6 +916,53 @@ sql.subscribe('delete:users',     () => /* all deletes on the public.users table
 sql.subscribe('update:users=1',   () => /* all updates on the users row with a primary key = 1 */ )
 ```
 
+### Transaction events (fork feature)
+
+Instead of one callback per row, `sql.subscribe('transaction', ...)` delivers **one event per
+database transaction** with all of its changes (mixed insert/update/delete) as an async
+iterable — see [specs/transaction-events.md](specs/transaction-events.md) for the full contract.
+
+```js
+const { unsubscribe } = await sql.subscribe('transaction', async (changes, info) => {
+  // info: { xid, streaming, lsn, date } — lsn/date are null until commit
+  try {
+    for await (const c of changes) {
+      // c: { command: 'insert'|'update'|'delete', row, old, relation, xid }
+      //  | { command: 'abort', xid } — a subtransaction (savepoint) was rolled back
+    }
+    // Iterator completed = the transaction COMMITTED. info.lsn/info.date are now set.
+  } catch (err) {
+    // The whole transaction was rolled back (or the connection was lost) —
+    // discard anything you applied from this iterator.
+  }
+})
+```
+
+On PostgreSQL 14+ this uses pgoutput `proto_version 2` with `streaming 'on'`: transactions
+larger than the server's `logical_decoding_work_mem` (default 64MB) are delivered in chunks
+**while still in progress**, so memory stays bounded no matter the transaction size. Smaller
+transactions arrive complete after commit (`info.streaming === false`), as does everything on
+PostgreSQL < 14 (automatic fallback).
+
+Things to know:
+
+- **Streamed changes are pre-commit.** Only act on them irrevocably after the iterator
+  completes, or apply them inside your own database transaction and roll back on error.
+  If you apply incrementally, create a `SAVEPOINT` whenever `change.xid` switches and roll
+  back to it when you receive an `{ command: 'abort', xid }` marker.
+- **Delivery is at-most-once.** A temporary replication slot is used, so changes arriving
+  while disconnected are lost after reconnect — live iterators reject on connection loss.
+- **Backpressure**: when more than `subscribe_high_water_mark` (option, default 1024) changes
+  are queued unconsumed, the replication stream is paused until consumers catch up (a
+  heartbeat keeps the connection alive). One stalled consumer therefore stalls all
+  subscribers on that connection.
+- **Per-row subscribers and streamed transactions**: in this fork, per-row events
+  (`'insert:users'` etc.) are not emitted for streamed (> `logical_decoding_work_mem`)
+  transactions. Normal-sized transactions behave exactly as upstream.
+- Callbacks can be invoked concurrently when large transactions interleave; order by
+  `info.lsn` if you need commit order. Empty transactions emit no event, and
+  `'transaction'` accepts no table/key filter.
+
 ## Numbers, bigint, numeric
 
 `Number` in javascript is only able to represent 2<sup>53</sup>-1 safely which means that types in PostgreSQLs like `bigint` and `numeric` won't fit into `Number`.

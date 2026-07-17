@@ -2169,7 +2169,7 @@ t('subscribe reconnects and calls onsubscribe', { timeout: 4 }, async() => {
   `
 
   await sql`insert into test (name) values ('Murray')`
-  await delay(10)
+  await delay(200)
   await subscribeSql.close()
   await delay(500)
   await sql`delete from test`

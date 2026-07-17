@@ -51,7 +51,7 @@ The package name stays `postgres`, so imports don't change. Generated `cjs/`, `d
 `cf/` outputs are committed, and `prepare` rebuilds them, so git installs work directly:
 
 ```sh
-pnpm add 'postgres@github:<owner>/postgres#v3.5.0'
+pnpm add 'postgres@github:<owner>/postgres#v3.6.0'
 ```
 
 Upgrading an app = bump the tag in `package.json`, `pnpm install`. For a private repo, CI
@@ -61,7 +61,7 @@ Alternative for many projects / cleaner CI: publish as a scoped package and alia
 imports still resolve to `postgres`:
 
 ```sh
-pnpm add postgres@npm:@<owner>/postgres@3.5.0
+pnpm add postgres@npm:@<owner>/postgres@3.6.0
 ```
 
 ## Fork-specific behavior differences from upstream

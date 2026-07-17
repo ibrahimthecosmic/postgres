@@ -16,6 +16,7 @@ sql.subscribe('transaction', async (changes, info) => {
   try {
     for await (const c of changes) {
       // c: { command: 'insert'|'update'|'delete', row, old, relation, xid }
+      //  | { command: 'truncate', relations, cascade, restartIdentity, xid }
       //  | { command: 'abort', xid }   ← subtransaction rollback marker
     }
     // iterator ended = COMMIT; info.lsn ('X/XXXXXXXX') and info.date are now set
@@ -35,9 +36,14 @@ sql.subscribe('transaction', async (changes, info) => {
    Begin/Stream Start: empty transactions and empty stream segments produce no event.
    The subscriber set is snapshotted at first change; late subscribers join at the next
    transaction.
-3. **Per-row events** — untouched for non-streamed transactions (identical to upstream).
-   Rows inside streamed transactions do NOT emit per-row events — deliberate fork
-   simplification (see Future work).
+3. **Per-row events are disabled** — `subscribe()` accepts only `'transaction'`; any
+   other event (`'*'`, `insert`, `update:users`, …) throws
+   `Only the transaction event is supported in this fork`. Rationale: per-row events
+   would silently skip rows inside streamed transactions (buffer-and-replay was
+   deliberately dropped), so allowing them invites silent data loss — failing loudly is
+   safer. The upstream fan-out machinery is kept intact (unreachable) to keep the diff
+   against upstream minimal; re-enabling is a one-function revert of `parseEvent`
+   (see Future work).
 4. **Subtransaction aborts** (ROLLBACK TO SAVEPOINT inside a streamed transaction) — the
    iterator yields `{ command: 'abort', xid: subxid }`. Every change carries its
    (sub)transaction xid, so a consumer applying changes inside its own DB transaction can
@@ -60,19 +66,26 @@ sql.subscribe('transaction', async (changes, info) => {
    TEMPORARY replication slot is recreated at the current WAL position on reconnect, so
    events resume for new transactions only and anything in between is lost. This is the
    same guarantee upstream's per-row subscribe has.
-9. **Version gate** — server ≥ 14 → `proto_version '2', streaming 'on'`; otherwise
+9. **TRUNCATE** — a truncate arrives as a single change
+   `{ command: 'truncate', relations: [relation, ...], cascade: boolean, restartIdentity: boolean, xid }`
+   (one message may cover several tables: explicit multi-table truncate or CASCADE via
+   foreign keys). `relations` entries have the same shape as `change.relation`. Works in
+   buffered, streamed, and proto v1 fallback paths; counts as a "first change" for lazy
+   fire. Requires the publication to publish truncate (default for
+   `CREATE PUBLICATION ... FOR ALL TABLES`).
+10. **Version gate** — server ≥ 14 → `proto_version '2', streaming 'on'`; otherwise
    `proto_version '1'` with the streaming option omitted entirely (PG ≤ 13 rejects any
    `streaming` option). The fallback assembles Begin..Commit in memory: same API,
    `info.streaming === false` always.
-10. **LSN format** — `'X/XXXXXXXX'` uppercase unpadded (Postgres `%X/%X`), e.g.
+11. **LSN format** — `'X/XXXXXXXX'` uppercase unpadded (Postgres `%X/%X`), e.g.
     `16/B374D848`. `info.lsn`/`info.date` are null until commit.
-11. **Ack discipline** — unchanged from upstream (keepalive walEnd / Begin final_lsn is
+12. **Ack discipline** — unchanged from upstream (keepalive walEnd / Begin final_lsn is
     acked before delivery). Safe only because the slot is TEMPORARY — there is never a
     replay. Must be revisited if durable slots are added.
-12. **Callback safety** — subscriber callbacks are invoked guarded, so a throwing
+13. **Callback safety** — subscriber callbacks are invoked guarded, so a throwing
     consumer cannot kill the replication connection.
-13. **Filters** — `'transaction'` accepts no path/key filter; `parseEvent` throws on
-    `transaction:<anything>`.
+14. **Filters** — `'transaction'` accepts no path/key filter; `parseEvent` throws on
+    `transaction:<anything>` and on any non-transaction event (see §3).
 
 ## Protocol notes (pgoutput v2)
 
@@ -86,12 +99,11 @@ sql.subscribe('transaction', async (changes, info) => {
 
 ## Future work (saved follow-ups — do not lose)
 
-- **TRUNCATE support**: parse the `T` message and yield
-  `{ command: 'truncate', relations: [...] }` in transaction iterators; consider per-row
-  `truncate` events too. (Explicitly requested to be kept on record.)
-- **Buffer-and-replay for per-row subscribers on streamed transactions** — restores
-  committed-only per-row semantics for huge transactions; required before offering this
-  feature upstream as a PR. The fork intentionally drops it for simplicity.
+- **Re-enable per-row events + buffer-and-replay for streamed transactions** — required
+  before offering this feature upstream as a PR: revert the `parseEvent` guard (the
+  upstream fan-out machinery is still in place) and add buffer-and-replay so per-row
+  subscribers get committed-only semantics for huge transactions. The fork intentionally
+  disables per-row events entirely (see Semantics §3).
 - **Durable named slots + commit-LSN acking** — at-least-once delivery across
   reconnects; requires ack discipline changes (see Semantics §11).
 - `subscribe_high_water_mark` is the only knob in v1; LWM is fixed at HWM/4.

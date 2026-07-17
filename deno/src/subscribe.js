@@ -174,7 +174,7 @@ export default function Subscribe(postgres, options) {
     }
 
     function row(a, b) {
-      dispatch(a, b)
+      b.command === 'truncate' || dispatch(a, b)
       if (begun) {
         tx === null && (tx = transaction(begun))
         tx && tx.push(change(a, b))
@@ -182,7 +182,9 @@ export default function Subscribe(postgres, options) {
     }
 
     function change(a, b) {
-      return { command: b.command, row: a, old: b.old || null, relation: b.relation, xid: b.xid }
+      return b.command === 'truncate'
+        ? { command: 'truncate', relations: b.relations, cascade: b.cascade, restartIdentity: b.restartIdentity, xid: b.xid }
+        : { command: b.command, row: a, old: b.old || null, relation: b.relation, xid: b.xid }
     }
 
     function dispatch(a, b) {
@@ -440,7 +442,24 @@ function parse(x, state, parsers, handle, transform) {
         xid
       })
     },
-    T: () => { /* noop */ }, // Truncate,
+    T: x => { // Truncate
+      let i = state.stream ? 5 : 1
+      const xid = state.stream ? x.readUInt32BE(1) : state.xid
+      const relations = Array(x.readUInt32BE(i))
+      const flags = x[i += 4]
+      i += 1
+      for (let r = 0; r < relations.length; r++) {
+        relations[r] = state[x.readUInt32BE(i)]
+        i += 4
+      }
+      handle(null, {
+        command: 'truncate',
+        relations,
+        cascade: !!(flags & 1),
+        restartIdentity: !!(flags & 2),
+        xid
+      })
+    },
     S: x => { // Stream Start
       state.stream = x.readUInt32BE(1)
     },
@@ -498,14 +517,5 @@ function parseEvent(x) {
     return 'transaction'
   }
 
-  const xs = x.match(/^(\*|insert|update|delete)?:?([^.]+?\.?[^=]+)?=?(.+)?/i) || []
-
-  if (!xs)
-    throw new Error('Malformed subscribe pattern: ' + x)
-
-  const [, command, path, key] = xs
-
-  return (command || '*')
-       + (path ? ':' + (path.indexOf('.') === -1 ? 'public.' + path : path) : '')
-       + (key ? '=' + key : '')
+  throw new Error('Only the transaction event is supported in this fork: ' + x)
 }

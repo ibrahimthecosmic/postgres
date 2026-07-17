@@ -2053,45 +2053,21 @@ t('multiple queries before connect', async() => {
   ]
 })
 
-t('subscribe', { timeout: 2 }, async() => {
+t('subscribe only supports transaction events', async() => {
   const sql = postgres({
     database: 'postgres_js_test',
     publications: 'alltables'
   })
 
-  await sql.unsafe('create publication alltables for all tables')
+  const message = x => sql.subscribe(x, () => { /* noop */ }).then(() => 'subscribed', e => e.message)
 
-  const result = []
-
-  const { unsubscribe } = await sql.subscribe('*', (row, { command, old }) => {
-    result.push(command, row.name, row.id, old && old.name, old && old.id)
-  })
-
-  await sql`
-    create table test (
-      id serial primary key,
-      name text
-    )
-  `
-
-  await sql`alter table test replica identity default`
-  await sql`insert into test (name) values ('Murray')`
-  await sql`update test set name = 'Rothbard'`
-  await sql`update test set id = 2`
-  await sql`delete from test`
-  await sql`alter table test replica identity full`
-  await sql`insert into test (name) values ('Murray')`
-  await sql`update test set name = 'Rothbard'`
-  await sql`delete from test`
-  await delay(10)
-  await unsubscribe()
-  await sql`insert into test (name) values ('Oh noes')`
-  await delay(10)
   return [
-    'insert,Murray,1,,,update,Rothbard,1,,,update,Rothbard,2,,1,delete,,2,,,insert,Murray,2,,,update,Rothbard,2,Murray,2,delete,Rothbard,2,,', // eslint-disable-line
-    result.join(','),
-    await sql`drop table test`,
-    await sql`drop publication alltables`,
+    [
+      'Only the transaction event is supported in this fork: *',
+      'Only the transaction event is supported in this fork: insert:test',
+      'The transaction event does not support filters: transaction:foo'
+    ].join('|'),
+    [await message('*'), await message('insert:test'), await message('transaction:foo')].join('|'),
     await sql.end()
   ]
 })
@@ -2112,9 +2088,10 @@ t('subscribe with transform', { timeout: 2 }, async() => {
 
   const result = []
 
-  const { unsubscribe } = await sql.subscribe('*', (row, { command, old }) =>
-    result.push(command, row.nameInCamel || row.id, old && old.nameInCamel)
-  )
+  const { unsubscribe } = await sql.subscribe('transaction', async changes => {
+    for await (const c of changes)
+      result.push(c.command, c.row.nameInCamel || c.row.id, c.old && c.old.nameInCamel)
+  })
 
   await sql`
     create table test (
@@ -2130,10 +2107,8 @@ t('subscribe with transform', { timeout: 2 }, async() => {
   await sql`insert into test (name_in_camel) values ('Murray')`
   await sql`update test set name_in_camel = 'Rothbard'`
   await sql`delete from test`
-  await delay(10)
+  await delay(200)
   await unsubscribe()
-  await sql`insert into test (name_in_camel) values ('Oh noes')`
-  await delay(10)
   return [
     'insert,Murray,,update,Rothbard,,delete,1,,insert,Murray,,update,Rothbard,Murray,delete,Rothbard,',
     result.join(','),
@@ -2156,8 +2131,11 @@ t('subscribe reconnects and calls onsubscribe', { timeout: 4 }, async() => {
   let onsubscribes = 0
 
   const { unsubscribe, sql: subscribeSql } = await sql.subscribe(
-    '*',
-    (row, { command, old }) => result.push(command, row.name || row.id, old && old.name),
+    'transaction',
+    async changes => {
+      for await (const c of changes)
+        result.push(c.command, c.row.name || c.row.id)
+    },
     () => onsubscribes++
   )
 
@@ -2169,14 +2147,14 @@ t('subscribe reconnects and calls onsubscribe', { timeout: 4 }, async() => {
   `
 
   await sql`insert into test (name) values ('Murray')`
-  await delay(10)
+  await delay(200)
   await subscribeSql.close()
   await delay(500)
   await sql`delete from test`
   await delay(100)
   await unsubscribe()
   return [
-    '2insert,Murray,,delete,1,',
+    '2insert,Murray,delete,1',
     onsubscribes + result.join(','),
     await sql`drop table test`,
     await sql`drop publication alltables`,
@@ -2323,7 +2301,47 @@ t('subscribe transaction streamed abort rejects iterator', { timeout: 10 }, asyn
   ]
 })
 
-t('subscribe per-row events skip streamed transactions', { timeout: 10 }, async() => {
+t('subscribe transaction truncate', { timeout: 5 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables'
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const result = []
+
+  const { unsubscribe } = await sql.subscribe('transaction', async changes => {
+    for await (const c of changes) {
+      c.command === 'truncate'
+        ? result.push(c.command, c.relations.map(r => r.table).join('+'), c.cascade, c.restartIdentity)
+        : result.push(c.command, c.row.name)
+    }
+  })
+
+  await sql`
+    create table test (
+      id serial primary key,
+      name text
+    )
+  `
+
+  await sql.begin(async sql => {
+    await sql`insert into test (name) values ('Murray')`
+    await sql`truncate test restart identity`
+  })
+  await delay(200)
+  await unsubscribe()
+  return [
+    'insert,Murray,truncate,test,false,true',
+    result.join(','),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe transaction streamed truncate', { timeout: 10 }, async() => {
   const sql = postgres({
     database: 'postgres_js_test',
     publications: 'alltables'
@@ -2344,21 +2362,29 @@ t('subscribe per-row events skip streamed transactions', { timeout: 10 }, async(
     )
   `
 
-  const rows = []
+  let inserts = 0
+    , truncated = ''
+    , streaming = false
 
-  const { unsubscribe } = await sql.subscribe('*', (row, { command }) => rows.push(command))
+  const { unsubscribe } = await sql.subscribe('transaction', async(changes, info) => {
+    for await (const c of changes) {
+      c.command === 'insert' && inserts++
+      c.command === 'truncate' && (truncated = c.relations.map(r => r.table) + ' ' + c.cascade + ' ' + c.restartIdentity)
+    }
+    streaming = info.streaming
+  })
 
-  await sql`insert into test (name) select repeat('x', 1000) from generate_series(1, 500)`
+  await sql.begin(async sql => {
+    await sql`insert into test (name) select repeat('x', 1000) from generate_series(1, 500)`
+    await sql`truncate test`
+  })
   await delay(500)
-  const afterStreamed = rows.length
-  await sql`insert into test (name) values ('after')`
-  await delay(200)
   await unsubscribe()
   await sql`alter system reset logical_decoding_work_mem`
   await sql`select pg_reload_conf()`
   return [
-    '0 insert',
-    afterStreamed + ' ' + rows.join(','),
+    'true 500 test false false',
+    streaming + ' ' + inserts + ' ' + truncated,
     await sql`drop table test`,
     await sql`drop publication alltables`,
     await sql.end()

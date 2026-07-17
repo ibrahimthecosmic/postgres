@@ -506,6 +506,7 @@ declare namespace postgres {
     | { command: 'insert', row: Row, old: null, relation: RelationInfo, xid: number }
     | { command: 'update', row: Row, old: Row | null, relation: RelationInfo, xid: number }
     | { command: 'delete', row: Row | null, old: null, relation: RelationInfo, xid: number }
+    | { command: 'truncate', relations: RelationInfo[], cascade: boolean, restartIdentity: boolean, xid: number }
     | { command: 'abort', xid: number };
 
   interface TransactionInfo {
@@ -735,7 +736,6 @@ declare namespace postgres {
     listen(channel: string, onnotify: (value: string) => void, onlisten?: (() => void) | undefined): ListenRequest;
 
     subscribe(event: 'transaction', cb: (changes: AsyncIterable<TransactionChange>, info: TransactionInfo) => void | Promise<void>, onsubscribe?: (() => void), onerror?: ((error: Error) => any)): Promise<SubscriptionHandle>;
-    subscribe(event: string, cb: (row: Row | null, info: ReplicationEvent) => void, onsubscribe?: (() => void), onerror?: (() => any)): Promise<SubscriptionHandle>;
 
     largeObject(oid?: number | undefined, /** @default 0x00020000 | 0x00040000 */ mode?: number | undefined): Promise<LargeObject>;
 

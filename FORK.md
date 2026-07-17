@@ -68,7 +68,11 @@ pnpm add postgres@npm:@<owner>/postgres@3.5.0
 
 - `sql.subscribe('transaction', fn)` — one async-iterable event per database transaction
   (pgoutput proto_version 2 + streaming on PG 14+; buffered fallback on PG < 14).
-- Per-row subscribe events are **not emitted for streamed transactions** (transactions whose
-  decoded size exceeds the server's `logical_decoding_work_mem`, default 64MB). Normal
-  transactions behave exactly as upstream. See specs/transaction-events.md §Future work.
+- Per-row subscribe events (`'*'`, `'insert:users'`, …) are **disabled** — `subscribe()`
+  throws on any event other than `'transaction'`. They could not see rows inside streamed
+  transactions (decoded size > server `logical_decoding_work_mem`, default 64MB), so they
+  were turned off rather than left silently lossy. The upstream fan-out code is kept
+  intact; re-enabling is a one-function revert of `parseEvent` in `src/subscribe.js`.
+- TRUNCATE is delivered to transaction iterators as
+  `{ command: 'truncate', relations, cascade, restartIdentity, xid }` (upstream ignores it).
 - New option `subscribe_high_water_mark` (default 1024).

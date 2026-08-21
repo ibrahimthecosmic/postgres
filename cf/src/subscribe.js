@@ -3,14 +3,15 @@ const noop = () => { /* noop */ }
 
 export default function Subscribe(postgres, options) {
   const subscribers = new Map()
-      , slot = 'postgresjs_' + Math.random().toString(36).slice(2)
       , state = {}
       , hwm = options.subscribe_high_water_mark || 1024
       , lwm = Math.ceil(hwm / 4)
 
   let connection
     , stream
+    , slot = 'postgresjs_' + Math.random().toString(36).slice(2)
     , ended = false
+    , reconnecting = false
 
   const sql = subscribe.sql = postgres({
     ...options,
@@ -23,14 +24,7 @@ export default function Subscribe(postgres, options) {
       ...options.connection,
       replication: 'database'
     },
-    onclose: async function() {
-      if (ended)
-        return
-      stream = null
-      state.pid = state.secret = undefined
-      connected(await init(sql, slot, options.publications))
-      subscribers.forEach(event => event.forEach(({ onsubscribe }) => onsubscribe()))
-    },
+    onclose: reestablish,
     no_subscribe: true
   })
 
@@ -50,13 +44,44 @@ export default function Subscribe(postgres, options) {
 
   return subscribe
 
+  // Serialized, guarded re-establishment, entered from both the connection's
+  // onclose and the replication stream's close. It must never reject (it is
+  // invoked without a handler — an unhandled rejection kills Node processes
+  // by default), and attempts genuinely can fail: a terminated walsender's
+  // late ErrorResponse rejects the freshly queued slot query. Retry with
+  // backoff until the stream is back or the instance ended; a fresh slot
+  // name per attempt sidesteps lingering TEMPORARY slots when the session
+  // survived the stream.
+  async function reestablish() {
+    if (ended || reconnecting)
+      return
+    reconnecting = true
+    stream = null
+    state.pid = state.secret = undefined
+    try {
+      for (let attempt = 0; !ended; attempt++) {
+        try {
+          slot = 'postgresjs_' + Math.random().toString(36).slice(2)
+          connected(await init(sql, slot, options.publications))
+          subscribers.forEach(event => event.forEach(({ onsubscribe }) => onsubscribe()))
+          break
+        } catch (error) {
+          subscribers.forEach(event => event.forEach(({ onerror }) => onerror(error)))
+          await new Promise(r => setTimeout(r, Math.min(1000, 50 << attempt)))
+        }
+      }
+    } finally {
+      reconnecting = false
+    }
+  }
+
   async function subscribe(event, fn, onsubscribe = noop, onerror = noop) {
     event = parseEvent(event)
 
     if (!connection)
       connection = init(sql, slot, options.publications)
 
-    const subscriber = { fn, onsubscribe }
+    const subscriber = { fn, onsubscribe, onerror }
     const fns = subscribers.has(event)
       ? subscribers.get(event).add(subscriber)
       : subscribers.set(event, new Set([subscriber])).get(event)
@@ -114,7 +139,7 @@ export default function Subscribe(postgres, options) {
     stream.on('data', data)
     stream.on('error', error)
     stream.on('close', teardown)
-    stream.on('close', sql.close)
+    stream.on('close', reestablish)
 
     return { stream, state: xs.state }
 

@@ -2162,6 +2162,50 @@ t('subscribe reconnects and calls onsubscribe', { timeout: 4 }, async() => {
   ]
 })
 
+t('subscribe survives walsender termination', { timeout: 10 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const result = []
+  let onsubscribes = 0
+
+  const { unsubscribe } = await sql.subscribe(
+    'transaction',
+    async changes => {
+      try {
+        for await (const c of changes)
+          result.push(c.command)
+      } catch (e) {
+        // connection loss rejects live iterators — expected here
+      }
+    },
+    () => onsubscribes++
+  )
+
+  await sql`create table test (id serial primary key)`
+  await sql`insert into test default values`
+  await delay(200)
+  // Kill the replication connection server-side: the reconnect must be
+  // serialized and guarded — no unhandled rejection, stream resumes.
+  await sql`select pg_terminate_backend(pid) from pg_stat_activity where backend_type = 'walsender'`
+  await delay(1000)
+  await sql`insert into test default values`
+  await delay(300)
+  await unsubscribe()
+  return [
+    '2insert,insert',
+    onsubscribes + result.join(','),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
 t('subscribe transaction', { timeout: 5 }, async() => {
   const sql = postgres({
     database: 'postgres_js_test',

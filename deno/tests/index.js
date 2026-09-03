@@ -2777,6 +2777,18 @@ t('subscribe durable slot recreates an invalidated slot', { timeout: 30 }, async
   ]
 })
 
+t('null elements in arrays decode as null', async() => {
+  const [x] = await sql`
+    select '{1,NULL,3}'::int[] as ints,
+           '{a,NULL,"NULL"}'::text[] as texts,
+           '{{1,NULL},{NULL,4}}'::int[][] as nested
+  `
+  return [
+    '[1,null,3]|["a",null,"NULL"]|[[1,null],[null,4]]',
+    [x.ints, x.texts, x.nested].map(v => JSON.stringify(v)).join('|')
+  ]
+})
+
 t('Execute', async() => {
   const result = await new Promise((resolve) => {
     const sql = postgres({ ...options, fetch_types: false, debug:(id, query) => resolve(query) })

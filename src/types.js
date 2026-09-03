@@ -282,6 +282,8 @@ function arrayParserLoop(s, x, parser, typarray) {
   const xs = []
   // Only _box (1020) has the ';' delimiter for arrays, all other types use the ',' delimiter
   const delimiter = typarray === 1020 ? ';' : ','
+  // An unquoted NULL token is SQL NULL - the literal string arrives quoted ("NULL").
+  const element = str => str === 'NULL' ? null : parser ? parser(str) : str
   for (; s.i < x.length; s.i++) {
     s.char = x[s.i]
     if (s.quoted) {
@@ -302,16 +304,16 @@ function arrayParserLoop(s, x, parser, typarray) {
       xs.push(arrayParserLoop(s, x, parser, typarray))
     } else if (s.char === '}') {
       s.quoted = false
-      s.last < s.i && xs.push(parser ? parser(x.slice(s.last, s.i)) : x.slice(s.last, s.i))
+      s.last < s.i && xs.push(element(x.slice(s.last, s.i)))
       s.last = s.i + 1
       break
     } else if (s.char === delimiter && s.p !== '}' && s.p !== '"') {
-      xs.push(parser ? parser(x.slice(s.last, s.i)) : x.slice(s.last, s.i))
+      xs.push(element(x.slice(s.last, s.i)))
       s.last = s.i + 1
     }
     s.p = s.char
   }
-  s.last < s.i && xs.push(parser ? parser(x.slice(s.last, s.i + 1)) : x.slice(s.last, s.i + 1))
+  s.last < s.i && xs.push(element(x.slice(s.last, s.i + 1)))
   return xs
 }
 

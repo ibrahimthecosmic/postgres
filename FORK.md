@@ -51,7 +51,7 @@ The package name stays `postgres`, so imports don't change. Generated `cjs/`, `d
 `cf/` outputs are committed, and `prepare` rebuilds them, so git installs work directly:
 
 ```sh
-pnpm add 'postgres@github:<owner>/postgres#v3.7.1'
+pnpm add 'postgres@github:<owner>/postgres#v3.7.2'
 ```
 
 Upgrading an app = bump the tag in `package.json`, `pnpm install`. For a private repo, CI
@@ -61,7 +61,7 @@ Alternative for many projects / cleaner CI: publish as a scoped package and alia
 imports still resolve to `postgres`:
 
 ```sh
-pnpm add postgres@npm:@<owner>/postgres@3.7.1
+pnpm add postgres@npm:@<owner>/postgres@3.7.2
 ```
 
 ## Fork-specific behavior differences from upstream
@@ -81,6 +81,8 @@ pnpm add postgres@npm:@<owner>/postgres@3.7.1
   instead of upstream's at-most-once. The slot only advances as the consumer acks
   (the transaction handler's promise resolving, or `info.ack()`), survives `sql.end()`, and
   is removed by the subscription's new `drop()`.
+- Array decoding maps an unquoted `NULL` element to `null` (upstream hands the token to the
+  element parser, yielding `NaN` / `'NULL'`); the quoted literal string `"NULL"` stays a string.
 - `subscribe()` takes a fifth options argument (`{ slot }`), and the subscription handle
   gained `drop()` and `slot`. `onsubscribe` receives `{ slot, resumed }` — `resumed: false`
   on a reconnect means the durable slot had to be recreated (dropped or invalidated while

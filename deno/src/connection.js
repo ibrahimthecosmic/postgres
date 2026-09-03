@@ -458,6 +458,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     hadError && options.shared.retries++
     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
     onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
+    // An end() awaited while this connection was still connecting (or busy)
+    // is only ever settled by terminate(); a socket that dies with nothing
+    // left to do must settle it too, or sql.end() hangs forever.
+    !initial && ended && (ended(), ending = ended = null)
   }
 
   /* Handlers */

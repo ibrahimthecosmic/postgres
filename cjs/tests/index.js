@@ -1870,6 +1870,19 @@ t('Catches connection config errors with end', async() => {
   ]
 })
 
+t('End settles while a connection is still failing to connect', { timeout: 5 }, async() => {
+  // Two concurrent queries open two connections; the first refusal rejects
+  // Promise.all and end() runs while the second is still connecting. Its
+  // socket then dies with no work left, and end() must settle on that.
+  const sql = postgres({ ...options, port: 1, connect_timeout: 2, max: 2 })
+
+  return [
+    'ECONNREFUSED',
+    await Promise.all([sql`select 1`, sql`select 2`]).catch((e) => e.code),
+    await sql.end()
+  ]
+})
+
 t('Catches query format errors', async() => [
   'wat',
   await sql.unsafe({ toString: () => { throw new Error('wat') } }).catch((e) => e.message)

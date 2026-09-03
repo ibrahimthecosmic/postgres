@@ -76,3 +76,10 @@ pnpm add postgres@npm:@<owner>/postgres@3.6.1
 - TRUNCATE is delivered to transaction iterators as
   `{ command: 'truncate', relations, cascade, restartIdentity, xid }` (upstream ignores it).
 - New option `subscribe_high_water_mark` (default 1024).
+- New option `slot` — a durable (named, non-TEMPORARY) replication slot. Streaming resumes
+  from the slot's `confirmed_flush_lsn` on reconnect, so delivery becomes at-least-once
+  instead of upstream's at-most-once. The slot only advances as the consumer acks
+  (the transaction handler's promise resolving, or `info.ack()`), survives `sql.end()`, and
+  is removed by the subscription's new `drop()`.
+- `subscribe()` takes a fifth options argument (`{ slot }`), and the subscription handle
+  gained `drop()` and `slot`.

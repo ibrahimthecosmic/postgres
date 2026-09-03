@@ -62,10 +62,11 @@ sql.subscribe('transaction', async (changes, info) => {
    commit/abort. No cross-transaction serialization; order by `info.lsn` if needed.
    One stalled consumer pauses the single replication stream for all subscribers
    (head-of-line blocking) — keep consumers moving or unsubscribe them.
-8. **Reconnects — at-most-once** — on stream close every live iterator rejects; the
-   TEMPORARY replication slot is recreated at the current WAL position on reconnect, so
-   events resume for new transactions only and anything in between is lost. This is the
-   same guarantee upstream's per-row subscribe has.
+8. **Reconnects — at-most-once (temporary slot)** — on stream close every live iterator
+   rejects; the TEMPORARY replication slot is recreated at the current WAL position on
+   reconnect, so events resume for new transactions only and anything in between is lost.
+   This is the same guarantee upstream's per-row subscribe has. With a durable slot
+   (§15) the guarantee becomes at-least-once instead.
 9. **TRUNCATE** — a truncate arrives as a single change
    `{ command: 'truncate', relations: [relation, ...], cascade: boolean, restartIdentity: boolean, xid }`
    (one message may cover several tables: explicit multi-table truncate or CASCADE via
@@ -79,13 +80,44 @@ sql.subscribe('transaction', async (changes, info) => {
    `info.streaming === false` always.
 11. **LSN format** — `'X/XXXXXXXX'` uppercase unpadded (Postgres `%X/%X`), e.g.
     `16/B374D848`. `info.lsn`/`info.date` are null until commit.
-12. **Ack discipline** — unchanged from upstream (keepalive walEnd / Begin final_lsn is
-    acked before delivery). Safe only because the slot is TEMPORARY — there is never a
-    replay. Must be revisited if durable slots are added.
+12. **Ack discipline** — with a temporary slot, unchanged from upstream (keepalive walEnd /
+    Begin final_lsn is acked before delivery). Safe only because the slot is TEMPORARY —
+    there is never a replay. With a durable slot the flushed/applied positions are
+    consumer-driven instead (§15).
 13. **Callback safety** — subscriber callbacks are invoked guarded, so a throwing
     consumer cannot kill the replication connection.
 14. **Filters** — `'transaction'` accepts no path/key filter; `parseEvent` throws on
     `transaction:<anything>` and on any non-transaction event (see §3).
+15. **Durable slots** — `postgres({ slot })`, or `subscribe(event, fn, onsubscribe,
+    onerror, { slot })`. The slot is created without `TEMPORARY` (an existing one is
+    reused: `42710` on create is the resume case, not an error), `START_REPLICATION`
+    passes `0/0` so the server resumes from `confirmed_flush_lsn`, and reconnects keep the
+    name instead of randomising it. Ack discipline:
+    - `state.lsn` (received) is reported as *written*; a separate `acked` position is
+      reported as *flushed* and *applied*, and only that moves `confirmed_flush_lsn`.
+      *written* is `max(received, acked)` so it never trails the confirmation.
+    - `acked` is seeded from the slot's `confirmed_flush_lsn` at startup — never `0/0`,
+      which the server would take literally and write back into the slot.
+    - A transaction is acked when every handler's returned promise has resolved, or on an
+      explicit `info.ack()`. Handlers that return a non-promise cannot be waited for and
+      ack at once. Confirmation is by commit-order prefix: a pending transaction holds
+      back every later one.
+    - The confirmed position is the commit message's **end_lsn** (`C` offset 10, `c`
+      offset 14), not its commit_lsn — the same position `pg_recvlogical` reports, so a
+      handled transaction is not redelivered.
+    - A rejecting or throwing handler deliberately does *not* ack: the slot stalls (loudly,
+      on the console and in `pg_replication_slots`) rather than dropping the transaction.
+    - Keepalives advance `acked` to the server's walEnd only when nothing is outstanding
+      (no queued commit, no open Begin, no live streamed transaction); otherwise the slot
+      would pin WAL for every unpublished write.
+    - Acks are coalesced onto a 100ms unref'd timer, and a keepalive with reply-requested
+      still answers immediately.
+    - Lifecycle: `sql.end()` leaves the slot in place; `subscription.drop()` ends the
+      stream, `DROP_REPLICATION_SLOT <name> WAIT` (retried on `55006` while the walsender
+      releases it), then ends the connection. An abandoned slot retains WAL indefinitely —
+      see `max_slot_wal_keep_size`.
+    - Slot names are validated against `[a-z0-9_]{1,63}` (they are interpolated into the
+      replication commands, which take no parameters).
 
 ## Protocol notes (pgoutput v2)
 
@@ -104,6 +136,4 @@ sql.subscribe('transaction', async (changes, info) => {
   upstream fan-out machinery is still in place) and add buffer-and-replay so per-row
   subscribers get committed-only semantics for huge transactions. The fork intentionally
   disables per-row events entirely (see Semantics §3).
-- **Durable named slots + commit-LSN acking** — at-least-once delivery across
-  reconnects; requires ack discipline changes (see Semantics §11).
 - `subscribe_high_water_mark` is the only knob in v1; LWM is fixed at HWM/4.

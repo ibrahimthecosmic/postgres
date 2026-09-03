@@ -119,6 +119,15 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    */
   publications: string
   /**
+   * Name of a durable (named) replication slot to subscribe on. The slot is created
+   * if missing, is not TEMPORARY, and streaming resumes from its confirmed LSN across
+   * reconnects - so changes committed while disconnected are still delivered. It
+   * survives `sql.end()`; remove it with the subscription's `drop()`.
+   * Lowercase letters, digits and underscores only (max 63).
+   * @default null (a fresh random TEMPORARY slot per connection)
+   */
+  slot: string | null
+  /**
    * Max queued-but-unconsumed changes across live transaction iterators before the
    * replication stream is paused (only relevant when calling `sql.subscribe('transaction')`)
    * @default 1024
@@ -515,10 +524,27 @@ declare namespace postgres {
     lsn: string | null;
     /** Commit timestamp; null until the transaction commits */
     date: Date | null;
+    /**
+     * Durable slots only: confirm this transaction now, without waiting for the
+     * handler's promise to resolve. No-op on a temporary slot.
+     */
+    ack(): void;
   }
 
   interface SubscriptionHandle {
     unsubscribe(): void;
+    /**
+     * Ends the subscription and drops its replication slot server-side. Only way to
+     * remove a durable slot - plain `sql.end()` deliberately keeps it.
+     */
+    drop(): Promise<void>;
+    /** Name of the replication slot currently streaming */
+    readonly slot: string;
+  }
+
+  interface SubscribeOptions {
+    /** Durable (named) replication slot to subscribe on - see the `slot` option */
+    slot?: string | undefined;
   }
 
   interface LargeObject {
@@ -733,7 +759,7 @@ declare namespace postgres {
 
     listen(channel: string, onnotify: (value: string) => void, onlisten?: (() => void) | undefined): ListenRequest;
 
-    subscribe(event: 'transaction', cb: (changes: AsyncIterable<TransactionChange>, info: TransactionInfo) => void | Promise<void>, onsubscribe?: (() => void), onerror?: ((error: Error) => any)): Promise<SubscriptionHandle>;
+    subscribe(event: 'transaction', cb: (changes: AsyncIterable<TransactionChange>, info: TransactionInfo) => void | Promise<void>, onsubscribe?: (() => void), onerror?: ((error: Error) => any), options?: SubscribeOptions | undefined): Promise<SubscriptionHandle>;
 
     largeObject(oid?: number | undefined, /** @default 0x00020000 | 0x00040000 */ mode?: number | undefined): Promise<LargeObject>;
 

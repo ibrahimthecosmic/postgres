@@ -10,6 +10,7 @@ export default function Subscribe(postgres, options) {
   let connection
     , stream
     , flush
+    , resumed = false
     , durable = !!options.slot
     , slot = options.slot || 'postgresjs_' + Math.random().toString(36).slice(2)
     , ended = false
@@ -79,8 +80,12 @@ export default function Subscribe(postgres, options) {
       for (let attempt = 0; !ended; attempt++) {
         try {
           durable || (slot = 'postgresjs_' + Math.random().toString(36).slice(2))
-          connected(await init(sql, slot, options.publications))
-          subscribers.forEach(event => event.forEach(({ onsubscribe }) => onsubscribe()))
+          const x = await init(sql, slot, options.publications)
+          // Late subscribers resolve through `connection` - point it at the
+          // live stream, or they would re-install the one that just closed.
+          connection = Promise.resolve(x)
+          connected(x)
+          subscribers.forEach(event => event.forEach(({ onsubscribe }) => onsubscribe(info())))
           break
         } catch (error) {
           subscribers.forEach(event => event.forEach(({ onerror }) => onerror(error)))
@@ -112,7 +117,7 @@ export default function Subscribe(postgres, options) {
 
     return connection.then(x => {
       connected(x)
-      onsubscribe()
+      onsubscribe(info())
       stream && stream.on('error', onerror)
       return { unsubscribe, drop, state, sql, get slot() { return slot } }
     })
@@ -127,6 +132,17 @@ export default function Subscribe(postgres, options) {
       throw new Error('The replication slot is already ' + slot + ' - it cannot be changed while subscribed')
     slot = name
     durable = true
+  }
+
+  // What onsubscribe learns about the stream it now rides: which slot, and
+  // whether this connect resumed an existing one (durable slots only - the
+  // server retained the WAL, nothing was missed) or created it, at the
+  // current position. Created after a disconnect means history is gone:
+  // the slot was dropped or invalidated while we were away, and a consumer
+  // that relies on at-least-once delivery has to treat it like a temporary
+  // slot's reconnect.
+  function info() {
+    return { slot, resumed }
   }
 
   function validateSlot(name) {
@@ -157,6 +173,7 @@ export default function Subscribe(postgres, options) {
   function connected(x) {
     stream = x.stream
     flush = x.flush
+    resumed = x.resumed
     state.pid = x.state.pid
     state.secret = x.state.secret
   }
@@ -165,11 +182,12 @@ export default function Subscribe(postgres, options) {
     if (!publications)
       throw new Error('Missing publication names')
 
-    const xs = durable
+    const { xs, resumed } = durable
       ? await durableSlot(sql, slot)
-      : await sql.unsafe(
-        `CREATE_REPLICATION_SLOT ${ slot } TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT`
-      )
+      : {
+        xs: await sql.unsafe(`CREATE_REPLICATION_SLOT ${ slot } TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT`),
+        resumed: false
+      }
 
     const [x] = xs
 
@@ -203,7 +221,7 @@ export default function Subscribe(postgres, options) {
     stream.on('close', teardown)
     stream.on('close', reestablish)
 
-    return { stream, state: xs.state, flush }
+    return { stream, state: xs.state, flush, resumed }
 
     // Send a scheduled ack now rather than losing it to the close - anything
     // acked but unconfirmed would simply be redelivered on the next connect.
@@ -525,17 +543,44 @@ export default function Subscribe(postgres, options) {
   // Create the named slot unless it is already there - an existing slot is the
   // resume case, not an error. The slot is not TEMPORARY, so the server keeps
   // the WAL for it while we are away. Reads back confirmed_flush_lsn as the
-  // point we may not confirm below.
+  // point we may not confirm below, and whether we resumed or created.
+  //
+  // A slot the server invalidated (it outgrew max_slot_wal_keep_size while we
+  // were away; wal_status 'lost') can never stream again - START_REPLICATION
+  // fails with 55000 every time, so retrying it is silence. Drop it and start
+  // over at the current position: that loses the retained history, which is
+  // exactly what resumed: false tells the consumer.
   async function durableSlot(sql, slot) {
+    let created = await createSlot(sql, slot)
+    let xs = await slotState(sql, slot)
+
+    if (xs[0].wal_status === 'lost') {
+      console.error('Replication slot ' + slot + ' was invalidated - recreating it, retained changes are lost') // eslint-disable-line
+      await sql.unsafe(`DROP_REPLICATION_SLOT ${ slot } WAIT`)
+      created = await createSlot(sql, slot)
+      xs = await slotState(sql, slot)
+    }
+
+    return { xs, resumed: !created }
+  }
+
+  async function createSlot(sql, slot) {
     try {
       await sql.unsafe(`CREATE_REPLICATION_SLOT ${ slot } LOGICAL pgoutput NOEXPORT_SNAPSHOT`)
+      return true
     } catch (error) {
       if (error.code !== '42710') // duplicate_object - ours to resume
         throw error
+      return false
     }
+  }
 
+  // wal_status arrived in PG 13; older servers never invalidate slots.
+  async function slotState(sql, slot) {
     const xs = await sql.unsafe(
-      `select coalesce(confirmed_flush_lsn, restart_lsn)::text as lsn from pg_replication_slots where slot_name = '${ slot }'`
+      `select coalesce(confirmed_flush_lsn, restart_lsn)::text as lsn${
+        parseInt(sql.parameters.server_version) >= 13 ? ', wal_status' : ''
+      } from pg_replication_slots where slot_name = '${ slot }'`
     )
 
     if (!xs.length || !xs[0].lsn)

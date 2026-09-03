@@ -118,6 +118,14 @@ sql.subscribe('transaction', async (changes, info) => {
       see `max_slot_wal_keep_size`.
     - Slot names are validated against `[a-z0-9_]{1,63}` (they are interpolated into the
       replication commands, which take no parameters).
+    - `onsubscribe({ slot, resumed })` on the initial connect and every reconnect.
+      `resumed` is true when the connect resumed an existing durable slot, false when it
+      created one at the current position (temporary slots: always false). On a
+      reconnect, `resumed: false` means the retained history is gone.
+    - An invalidated slot (`wal_status = 'lost'`: it outgrew `max_slot_wal_keep_size` while
+      disconnected) can never stream again - `START_REPLICATION` fails with `55000` on
+      every attempt. The connect drops it and creates it afresh, logs that, and reports
+      `resumed: false`. Servers before PG 13 have no `wal_status` and never invalidate.
 
 ## Protocol notes (pgoutput v2)
 

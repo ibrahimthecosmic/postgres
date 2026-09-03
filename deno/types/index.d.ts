@@ -549,6 +549,20 @@ declare namespace postgres {
     slot?: string | undefined;
   }
 
+  /** Passed to `onsubscribe` on the initial connect and on every reconnect */
+  interface SubscribeInfo {
+    /** Name of the replication slot the stream now rides */
+    slot: string;
+    /**
+     * True when this connect resumed an existing durable slot - the server retained
+     * the WAL, nothing was missed. False when the slot was created at the current
+     * position: always for a temporary slot; for a durable slot on its first use, or
+     * after it was dropped or invalidated (`max_slot_wal_keep_size`) while disconnected -
+     * on a reconnect that means the retained history is gone.
+     */
+    resumed: boolean;
+  }
+
   interface LargeObject {
     writable(options?: {
       highWaterMark?: number | undefined,
@@ -761,7 +775,7 @@ declare namespace postgres {
 
     listen(channel: string, onnotify: (value: string) => void, onlisten?: (() => void) | undefined): ListenRequest;
 
-    subscribe(event: 'transaction', cb: (changes: AsyncIterable<TransactionChange>, info: TransactionInfo) => void | Promise<void>, onsubscribe?: (() => void), onerror?: ((error: Error) => any), options?: SubscribeOptions | undefined): Promise<SubscriptionHandle>;
+    subscribe(event: 'transaction', cb: (changes: AsyncIterable<TransactionChange>, info: TransactionInfo) => void | Promise<void>, onsubscribe?: ((info: SubscribeInfo) => void), onerror?: ((error: Error) => any), options?: SubscribeOptions | undefined): Promise<SubscriptionHandle>;
 
     largeObject(oid?: number | undefined, /** @default 0x00020000 | 0x00040000 */ mode?: number | undefined): Promise<LargeObject>;
 

@@ -957,6 +957,13 @@ await subscription.drop()  // ends the subscription and removes the slot
 - **An abandoned slot retains WAL forever.** Nothing drops a named slot for you: use
   `subscription.drop()` (or `SELECT pg_drop_replication_slot(…)`) and consider bounding the
   damage with the server's `max_slot_wal_keep_size`.
+- **`onsubscribe` tells you whether the slot resumed.** It receives `{ slot, resumed }` on
+  the initial connect and on every reconnect: `resumed: true` means the server retained the
+  WAL and nothing was missed; `resumed: false` on a reconnect means the slot had to be
+  created afresh — it was dropped, or the server invalidated it (`max_slot_wal_keep_size`),
+  while you were away — and whatever was committed in between is gone. An invalidated slot
+  is dropped and recreated automatically (retrying it could never succeed); a temporary slot
+  reports `resumed: false` on every connect.
 - One slot streams to one connection: a second subscriber on the same name fails with the
   server's *replication slot is active* error rather than silently splitting the stream.
   The initial `subscribe()` rejects on that error (reconnects retry it with backoff), so

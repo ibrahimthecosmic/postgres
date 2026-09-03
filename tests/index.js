@@ -2630,6 +2630,151 @@ t('subscribe rejects invalid slot names', async() => {
   ]
 })
 
+t('subscribe durable slot reports resumed to onsubscribe', { timeout: 20 }, async() => {
+  const slot = 'postgresjs_test_resumed'
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+  await sql`select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = ${ slot }`
+  await sql`create table test (id serial primary key, name text)`
+
+  const subscriber = x => postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false,
+    ...x
+  })
+
+  const infos = []
+      , seen = []
+
+  const listen = (x, tag) => x.subscribe(
+    'transaction',
+    async changes => {
+      try {
+        for await (const c of changes)
+          c.command === 'insert' && seen.push(tag + c.row.name)
+      } catch (e) {
+        // connection loss rejects live iterators — expected here
+      }
+    },
+    info => infos.push(tag + (info.slot === slot ? 'named' : 'random') + ':' + info.resumed)
+  )
+
+  const temporary = subscriber({})
+  const durable = subscriber({ slot })
+  await listen(temporary, 't')
+  await listen(durable, 'd')
+
+  await sql`insert into test (name) values ('a')`
+  await delay(300)
+
+  // Kill the replication connections, then write while nobody is listening:
+  // the temporary slot comes back fresh, the durable one resumes and replays.
+  await sql`select pg_terminate_backend(pid) from pg_stat_activity where backend_type = 'walsender'`
+  while ((await sql`select active_pid from pg_replication_slots where slot_name = ${ slot }`)[0].active_pid)
+    await delay(20)
+  await sql`insert into test (name) values ('b')`
+  await delay(1000)
+  await sql`insert into test (name) values ('c')`
+  await delay(300)
+
+  await temporary.end()
+  const handle = await durable.subscribe('transaction', () => { /* noop */ })
+  await handle.drop()
+  await durable.end()
+
+  return [
+    'dnamed:false,dnamed:true,trandom:false,trandom:false da,db,dc',
+    infos.sort().join(',') + ' ' + seen.filter(x => x[0] === 'd').join(','),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe durable slot recreates an invalidated slot', { timeout: 30 }, async() => {
+  const slot = 'postgresjs_test_lost'
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+  await sql`select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = ${ slot }`
+  await sql`create table test (id serial primary key, name text)`
+
+  const subscriber = () => postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false,
+    slot
+  })
+
+  const infos = []
+      , seen = []
+
+  const listen = x => x.subscribe(
+    'transaction',
+    async changes => {
+      try {
+        for await (const c of changes)
+          c.command === 'insert' && seen.push(c.row.name)
+      } catch (e) {
+        // connection loss rejects live iterators — expected here
+      }
+    },
+    info => infos.push(info.resumed)
+  )
+
+  const first = subscriber()
+  const a = await listen(first)
+  await sql`insert into test (name) values ('a')`
+  await delay(300)
+  await a.sql.end()
+  await first.end()
+
+  // History the slot retains but may no longer serve: cap what a slot can
+  // hold at less than one segment, move past the slot's position, and let a
+  // checkpoint invalidate it.
+  await sql`insert into test (name) values ('lost')`
+  try {
+    await sql`alter system set max_slot_wal_keep_size = '1MB'`
+    await sql`select pg_reload_conf()`
+    await delay(300)
+    await sql`select pg_switch_wal()`
+    await sql`insert into test (name) values ('lost too')`
+    await sql`select pg_switch_wal()`
+    await sql`checkpoint`
+  } finally {
+    await sql`alter system reset max_slot_wal_keep_size`
+    await sql`select pg_reload_conf()`
+  }
+  const [{ wal_status: before }] = await sql`select wal_status from pg_replication_slots where slot_name = ${ slot }`
+
+  const second = subscriber()
+  const b = await listen(second)
+  await sql`insert into test (name) values ('b')`
+  await delay(500)
+  const [{ wal_status: after }] = await sql`select wal_status from pg_replication_slots where slot_name = ${ slot }`
+
+  await b.drop()
+  await second.end()
+
+  return [
+    'lost a,b false,false reserved',
+    before + ' ' + seen.join(',') + ' ' + infos.join(',') + ' ' + after,
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
 t('Execute', async() => {
   const result = await new Promise((resolve) => {
     const sql = postgres({ ...options, fetch_types: false, debug:(id, query) => resolve(query) })

@@ -2437,6 +2437,201 @@ t('subscribe transaction streamed truncate', { timeout: 10 }, async() => {
   ]
 })
 
+t('subscribe durable slot resumes from the confirmed lsn', { timeout: 20 }, async() => {
+  const slot = 'postgresjs_test_durable'
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+  await sql`select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = ${ slot }`
+  await sql`create table test (id serial primary key, name text)`
+
+  const seen = []
+  const subscriber = () => postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false,
+    slot
+  })
+
+  const listen = x => x.subscribe('transaction', async changes => {
+    for await (const c of changes)
+      c.command === 'insert' && seen.push(c.row.name)
+  })
+
+  const first = subscriber()
+  const a = await listen(first)
+  await sql`insert into test (name) values ('a')`
+  await delay(300)
+
+  // Ending the subscription must leave the slot behind - that is the point
+  await a.sql.end()
+  await first.end()
+  await delay(300)
+
+  // Changes committed while nobody is listening are retained by the slot
+  await sql`insert into test (name) values ('b')`
+  await sql`insert into test (name) values ('c')`
+
+  const second = subscriber()
+  const b = await listen(second)
+  await delay(500)
+
+  const [{ kept }] = await sql`select count(*)::int as kept from pg_replication_slots where slot_name = ${ slot }`
+  await b.drop()
+  const [{ kept: dropped }] = await sql`select count(*)::int as kept from pg_replication_slots where slot_name = ${ slot }`
+  await second.end()
+
+  return [
+    'a,b,c 1 0',
+    seen.join(',') + ' ' + kept + ' ' + dropped,
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe durable slot confirms only what the consumer acked', { timeout: 20 }, async() => {
+  const slot = 'postgresjs_test_ack'
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+  await sql`select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = ${ slot }`
+  await sql`create table test (id serial primary key, name text)`
+
+  const subscriber = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  let release
+    , info
+
+  const gate = new Promise(r => release = r)
+
+  const handle = await subscriber.subscribe('transaction', async(changes, x) => {
+    for await (const c of changes) // eslint-disable-line
+      ;
+    info = x
+    await gate
+  }, undefined, undefined, { slot })
+
+  await sql`insert into test (name) values ('a')`
+  await delay(400)
+
+  const [{ pending }] = await sql`
+    select confirmed_flush_lsn < ${ info.lsn }::pg_lsn as pending
+    from pg_replication_slots where slot_name = ${ slot }
+  `
+
+  release()
+  await delay(500)
+
+  const [{ advanced }] = await sql`
+    select confirmed_flush_lsn > ${ info.lsn }::pg_lsn as advanced
+    from pg_replication_slots where slot_name = ${ slot }
+  `
+
+  await handle.drop()
+  await subscriber.end()
+
+  return [
+    'true true ' + slot,
+    pending + ' ' + advanced + ' ' + handle.slot,
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe durable slot replays transactions the consumer never acked', { timeout: 20 }, async() => {
+  const slot = 'postgresjs_test_replay'
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+  await sql`select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = ${ slot }`
+  await sql`create table test (id serial primary key, name text)`
+
+  const subscriber = () => postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false,
+    slot
+  })
+
+  const seen = []
+      , replayed = []
+
+  const gate = new Promise(() => { /* never settles */ })
+
+  const first = subscriber()
+  const a = await first.subscribe('transaction', async changes => {
+    for await (const c of changes)
+      c.command === 'insert' && seen.push(c.row.name)
+    // Never settles for 'b', so that transaction is handled but never acked
+    seen[seen.length - 1] === 'b' && await gate
+  })
+
+  await sql`insert into test (name) values ('a')`
+  await delay(300)
+  await sql`insert into test (name) values ('b')`
+  await delay(300)
+
+  await a.sql.end()
+  await first.end()
+  await delay(300)
+
+  const second = subscriber()
+  const b = await second.subscribe('transaction', async changes => {
+    for await (const c of changes)
+      c.command === 'insert' && replayed.push(c.row.name)
+  })
+  await delay(700)
+
+  await b.drop()
+  await second.end()
+
+  return [
+    'a,b b',
+    seen.join(',') + ' ' + replayed.join(','),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe rejects invalid slot names', async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables'
+  })
+
+  const message = x => sql
+    .subscribe('transaction', () => { /* noop */ }, undefined, undefined, { slot: x })
+    .then(() => 'subscribed', e => e.message)
+
+  return [
+    [
+      'Invalid replication slot name: Nope - use lowercase letters, digits and underscores (max 63)',
+      'Invalid replication slot name: a"b - use lowercase letters, digits and underscores (max 63)'
+    ].join('|'),
+    [await message('Nope'), await message('a"b')].join('|'),
+    await sql.end()
+  ]
+})
+
 t('Execute', async() => {
   const result = await new Promise((resolve) => {
     const sql = postgres({ ...options, fetch_types: false, debug:(id, query) => resolve(query) })

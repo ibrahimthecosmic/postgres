@@ -9,7 +9,9 @@ export default function Subscribe(postgres, options) {
 
   let connection
     , stream
-    , slot = 'postgresjs_' + Math.random().toString(36).slice(2)
+    , flush
+    , durable = !!options.slot
+    , slot = options.slot || 'postgresjs_' + Math.random().toString(36).slice(2)
     , ended = false
     , reconnecting = false
 
@@ -31,15 +33,28 @@ export default function Subscribe(postgres, options) {
   const end = sql.end
       , close = sql.close
 
-  sql.end = async() => {
+  sql.end = async(...xs) => {
     ended = true
-    stream && (await new Promise(r => (stream.once('close', r), stream.end())))
-    return end()
+    await endStream()
+    return end(...xs)
   }
 
-  sql.close = async() => {
-    stream && (await new Promise(r => (stream.once('close', r), stream.end())))
-    return close()
+  sql.close = async(...xs) => {
+    await endStream()
+    return close(...xs)
+  }
+
+  // Idempotent: the outer sql.end() ends the subscription pool too, so this
+  // runs twice on a normal teardown - waiting for 'close' on an already closed
+  // stream never returns.
+  function endStream() {
+    const s = stream
+    stream = null
+    flush && flush()
+    flush = null
+    return s && !s.destroyed && !s.writableEnded
+      ? new Promise(r => (s.once('close', r), s.end()))
+      : Promise.resolve()
   }
 
   return subscribe
@@ -51,7 +66,9 @@ export default function Subscribe(postgres, options) {
   // late ErrorResponse rejects the freshly queued slot query. Retry with
   // backoff until the stream is back or the instance ended; a fresh slot
   // name per attempt sidesteps lingering TEMPORARY slots when the session
-  // survived the stream.
+  // survived the stream. A durable (named) slot keeps its name — that is the
+  // whole point: the server retained the WAL and we resume from the last
+  // confirmed LSN.
   async function reestablish() {
     if (ended || reconnecting)
       return
@@ -61,7 +78,7 @@ export default function Subscribe(postgres, options) {
     try {
       for (let attempt = 0; !ended; attempt++) {
         try {
-          slot = 'postgresjs_' + Math.random().toString(36).slice(2)
+          durable || (slot = 'postgresjs_' + Math.random().toString(36).slice(2))
           connected(await init(sql, slot, options.publications))
           subscribers.forEach(event => event.forEach(({ onsubscribe }) => onsubscribe()))
           break
@@ -75,8 +92,10 @@ export default function Subscribe(postgres, options) {
     }
   }
 
-  async function subscribe(event, fn, onsubscribe = noop, onerror = noop) {
+  async function subscribe(event, fn, onsubscribe = noop, onerror = noop, subscribeOptions) {
     event = parseEvent(event)
+    subscribeOptions && subscribeOptions.slot !== undefined && useSlot(subscribeOptions.slot)
+    durable && validateSlot(slot)
 
     if (!connection)
       connection = init(sql, slot, options.publications)
@@ -95,12 +114,49 @@ export default function Subscribe(postgres, options) {
       connected(x)
       onsubscribe()
       stream && stream.on('error', onerror)
-      return { unsubscribe, state, sql }
+      return { unsubscribe, drop, state, sql, get slot() { return slot } }
     })
+  }
+
+  // The slot belongs to the subscription's single replication connection, so
+  // every subscriber on the same sql shares it — naming it twice is fine,
+  // renaming it is not.
+  function useSlot(name) {
+    validateSlot(name)
+    if (connection && name !== slot)
+      throw new Error('The replication slot is already ' + slot + ' - it cannot be changed while subscribed')
+    slot = name
+    durable = true
+  }
+
+  function validateSlot(name) {
+    if (typeof name !== 'string' || !/^[a-z0-9_]{1,63}$/.test(name))
+      throw new Error('Invalid replication slot name: ' + name + ' - use lowercase letters, digits and underscores (max 63)')
+  }
+
+  // Ends the subscription and removes the slot server-side. Plain sql.end()
+  // deliberately leaves a durable slot behind (that is what makes it durable),
+  // so this is the only way to stop paying its WAL retention.
+  async function drop() {
+    ended = true
+    await endStream()
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await sql.unsafe(`DROP_REPLICATION_SLOT ${ slot } WAIT`)
+        break
+      } catch (error) {
+        // 55006 object_in_use - the walsender has not released the slot yet
+        if (error.code !== '55006' || attempt >= 10)
+          throw error
+        await new Promise(r => setTimeout(r, 100))
+      }
+    }
+    return end()
   }
 
   function connected(x) {
     stream = x.stream
+    flush = x.flush
     state.pid = x.state.pid
     state.secret = x.state.secret
   }
@@ -109,39 +165,55 @@ export default function Subscribe(postgres, options) {
     if (!publications)
       throw new Error('Missing publication names')
 
-    const xs = await sql.unsafe(
-      `CREATE_REPLICATION_SLOT ${ slot } TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT`
-    )
+    const xs = durable
+      ? await durableSlot(sql, slot)
+      : await sql.unsafe(
+        `CREATE_REPLICATION_SLOT ${ slot } TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT`
+      )
 
     const [x] = xs
 
     const v2 = parseInt(sql.parameters.server_version) >= 14
 
+    // 0/0 tells the server to resume the durable slot from its confirmed_flush_lsn.
     const stream = await sql.unsafe(
       `START_REPLICATION SLOT ${ slot } LOGICAL ${
-        x.consistent_point
+        durable ? '0/0' : x.consistent_point
       } (proto_version '${ v2 ? '2' : '1' }', publication_names '${ publications }'${ v2 ? ', streaming \'on\'' : '' })`
     ).writable()
 
     const state = {
-      lsn: Buffer.concat(x.consistent_point.split('/').map(x => Buffer.from(('00000000' + x).slice(-8), 'hex')))
+      lsn: lsn(durable ? x.lsn : x.consistent_point)
     }
 
     const live = new Set()
         , txs = new Map()
+        , unacked = []
 
     let tx = null
       , begun = null
       , queued = 0
       , paused = false
       , heartbeat = null
+      , acking = null
+      , acked = state.lsn
 
     stream.on('data', data)
     stream.on('error', error)
     stream.on('close', teardown)
     stream.on('close', reestablish)
 
-    return { stream, state: xs.state }
+    return { stream, state: xs.state, flush }
+
+    // Send a scheduled ack now rather than losing it to the close - anything
+    // acked but unconfirmed would simply be redelivered on the next connect.
+    function flush() {
+      if (!acking)
+        return
+      clearTimeout(acking)
+      acking = null
+      stream.destroyed || stream.writableEnded || pong()
+    }
 
     function error(e) {
       console.error('Unexpected error during logical streaming - reconnecting', e) // eslint-disable-line
@@ -150,9 +222,14 @@ export default function Subscribe(postgres, options) {
     function data(x) {
       if (x[0] === 0x77) {
         parse(x.subarray(25), state, sql.options.parsers, handle, options.transform)
-      } else if (x[0] === 0x6b && x[17]) {
-        state.lsn = x.subarray(1, 9)
-        pong()
+      } else if (x[0] === 0x6b) {
+        // Nothing decoded is outstanding, so the server's walEnd is safe to confirm -
+        // without this the slot would pin the WAL of every unpublished write.
+        durable && !unacked.length && !begun && !txs.size && (acked = Buffer.from(x.subarray(1, 9)))
+        if (x[17]) {
+          state.lsn = x.subarray(1, 9)
+          pong()
+        }
       }
     }
 
@@ -172,6 +249,7 @@ export default function Subscribe(postgres, options) {
 
     function commit(b) {
       tx && (tx.info.lsn = b.lsn, tx.info.date = b.date, tx.end())
+      track(tx, b.end)
       tx = begun = null
     }
 
@@ -179,6 +257,7 @@ export default function Subscribe(postgres, options) {
       const t = txs.get(b.xid)
       txs.delete(b.xid)
       t && (t.info.lsn = b.lsn, t.info.date = b.date, t.end())
+      track(t, b.end)
     }
 
     function streamAbort(b) {
@@ -230,24 +309,92 @@ export default function Subscribe(postgres, options) {
       const t = {
         info,
         iterators: [],
+        waiting: 0,
+        failed: false,
+        acked: false,
+        onack: null,
         push: x => t.iterators.forEach(it => it.push(x)),
         end: () => (live.delete(t), t.iterators.forEach(it => it.end())),
         error: e => (live.delete(t), t.iterators.forEach(it => it.error(e)))
       }
 
+      info.ack = ack
+
+      // With a durable slot the returned promise is the ack signal: the slot
+      // may only advance past this transaction once every handler has settled.
+      // A handler that returns nothing cannot be waited for and acks at once.
       fns.forEach(({ fn }) => {
         const it = Changes()
         t.iterators.push(it)
         try {
           const x = fn(it.changes, info, 'transaction')
-          x && typeof x.catch === 'function' && x.catch(error)
+          if (!x || typeof x.catch !== 'function')
+            return
+          durable
+            ? (t.waiting++, x.then(() => settled(false), e => settled(true, e)))
+            : x.catch(error)
         } catch (e) {
-          error(e)
+          durable ? failed(e) : error(e)
         }
       })
 
+      durable && t.waiting === 0 && !t.failed && ack()
+
       live.add(t)
       return t
+
+      function settled(rejected, e) {
+        rejected && failed(e)
+        --t.waiting === 0 && !t.failed && ack()
+      }
+
+      // Deliberately does not ack: dropping a transaction the consumer could
+      // not handle is worse than a stalled slot, which is at least visible in
+      // pg_replication_slots. Call info.ack() to skip it on purpose.
+      function failed(e) {
+        t.failed = true
+        console.error( // eslint-disable-line
+          'Transaction handler failed - replication slot ' + slot + ' cannot advance past ' + (t.info.lsn || 'xid ' + t.info.xid),
+          e
+        )
+      }
+
+      function ack() {
+        if (t.acked)
+          return
+        t.acked = true
+        t.onack && t.onack()
+      }
+    }
+
+    // Durable slots only: hold the commit's end LSN until the consumer is done
+    // with the transaction, then confirm the longest fully handled prefix.
+    // t is false/undefined when nothing was listening - nothing can be lost.
+    function track(t, end) {
+      if (!durable)
+        return
+
+      const entry = { lsn: Buffer.from(end), done: false }
+      unacked.push(entry)
+      t && !t.acked
+        ? (t.onack = () => confirm(entry))
+        : confirm(entry)
+    }
+
+    function confirm(entry) {
+      entry.done = true
+      let advanced = false
+      while (unacked.length && unacked[0].done)
+        acked = unacked.shift().lsn, advanced = true
+
+      if (!advanced || acking)
+        return
+
+      acking = setTimeout(() => {
+        acking = null
+        stream && !stream.destroyed && pong()
+      }, 100)
+      acking.unref && acking.unref()
     }
 
     function Changes() {
@@ -345,11 +492,13 @@ export default function Subscribe(postgres, options) {
 
     function teardown() {
       clearInterval(heartbeat)
-      heartbeat = null
+      clearTimeout(acking)
+      heartbeat = acking = null
       paused = false
       queued = 0
       tx = begun = null
       txs.clear()
+      unacked.length = 0
       const e = new Error('Subscription stream closed')
       live.forEach(t => t.error(e))
       live.clear()
@@ -358,15 +507,50 @@ export default function Subscribe(postgres, options) {
     function pong() {
       const x = Buffer.alloc(34)
       x[0] = 'r'.charCodeAt(0)
-      x.fill(state.lsn, 1)
+      if (durable) {
+        // written / flushed / applied. Only flushed and applied move the slot's
+        // confirmed_flush_lsn, so they carry what the consumer has handled.
+        const written = Buffer.compare(acked, state.lsn) > 0 ? acked : state.lsn
+        written.copy(x, 1)
+        acked.copy(x, 9)
+        acked.copy(x, 17)
+      } else {
+        x.fill(state.lsn, 1)
+      }
       x.writeBigInt64BE(BigInt(Date.now() - Date.UTC(2000, 0, 1)) * BigInt(1000), 25)
       stream.write(x)
     }
   }
 
+  // Create the named slot unless it is already there - an existing slot is the
+  // resume case, not an error. The slot is not TEMPORARY, so the server keeps
+  // the WAL for it while we are away. Reads back confirmed_flush_lsn as the
+  // point we may not confirm below.
+  async function durableSlot(sql, slot) {
+    try {
+      await sql.unsafe(`CREATE_REPLICATION_SLOT ${ slot } LOGICAL pgoutput NOEXPORT_SNAPSHOT`)
+    } catch (error) {
+      if (error.code !== '42710') // duplicate_object - ours to resume
+        throw error
+    }
+
+    const xs = await sql.unsafe(
+      `select coalesce(confirmed_flush_lsn, restart_lsn)::text as lsn from pg_replication_slots where slot_name = '${ slot }'`
+    )
+
+    if (!xs.length || !xs[0].lsn)
+      throw new Error('Replication slot ' + slot + ' has no confirmed position')
+
+    return xs
+  }
+
   function call(x, a, b) {
     subscribers.has(x) && subscribers.get(x).forEach(({ fn }) => fn(a, b, x))
   }
+}
+
+function lsn(x) {
+  return Buffer.concat(x.split('/').map(x => Buffer.from(('00000000' + x).slice(-8), 'hex')))
 }
 
 function Time(x) {
@@ -492,13 +676,13 @@ function parse(x, state, parsers, handle, transform) {
       state.stream = null
     },
     c: x => { // Stream Commit
-      handle(null, { command: 'stream_commit', xid: x.readUInt32BE(1), lsn: Lsn(x, 6), date: Time(x.readBigInt64BE(22)) })
+      handle(null, { command: 'stream_commit', xid: x.readUInt32BE(1), lsn: Lsn(x, 6), end: x.subarray(14, 22), date: Time(x.readBigInt64BE(22)) })
     },
     A: x => { // Stream Abort
       handle(null, { command: 'stream_abort', xid: x.readUInt32BE(1), subxid: x.readUInt32BE(5) })
     },
     C: x => { // Commit
-      handle(null, { command: 'commit', lsn: Lsn(x, 2), date: Time(x.readBigInt64BE(18)) })
+      handle(null, { command: 'commit', lsn: Lsn(x, 2), end: x.subarray(10, 18), date: Time(x.readBigInt64BE(18)) })
     }
   }).reduce(char, {})[x[0]](x)
 }

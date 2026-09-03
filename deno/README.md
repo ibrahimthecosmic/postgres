@@ -912,8 +912,9 @@ Things to know:
   completes, or apply them inside your own database transaction and roll back on error.
   If you apply incrementally, create a `SAVEPOINT` whenever `change.xid` switches and roll
   back to it when you receive an `{ command: 'abort', xid }` marker.
-- **Delivery is at-most-once.** A temporary replication slot is used, so changes arriving
-  while disconnected are lost after reconnect — live iterators reject on connection loss.
+- **Delivery is at-most-once by default.** A temporary replication slot is used, so changes
+  arriving while disconnected are lost after reconnect — live iterators reject on connection
+  loss. Pass a `slot` name for at-least-once delivery instead (below).
 - **Backpressure**: when more than `subscribe_high_water_mark` (option, default 1024) changes
   are queued unconsumed, the replication stream is paused until consumers catch up (a
   heartbeat keeps the connection alive). One stalled consumer therefore stalls all
@@ -924,6 +925,43 @@ Things to know:
 - Callbacks can be invoked concurrently when large transactions interleave; order by
   `info.lsn` if you need commit order. Empty transactions emit no event, and
   `'transaction'` accepts no table/key filter.
+
+### Durable slots (fork feature)
+
+Naming the replication slot switches delivery from at-most-once to **at-least-once**: the slot
+is created without `TEMPORARY`, so PostgreSQL retains the WAL while you are away and streaming
+resumes from the last position you confirmed.
+
+```js
+const sql = postgres({ publications: 'alltables', slot: 'my_consumer' })
+// or per call: sql.subscribe('transaction', fn, onsubscribe, onerror, { slot: 'my_consumer' })
+
+const subscription = await sql.subscribe('transaction', async (changes, info) => {
+  for await (const c of changes)
+    await apply(c)
+  // Returning (resolving) is the ack — only now may the slot advance past this commit.
+})
+
+await sql.end()            // the slot stays, and so does the WAL behind it
+await subscription.drop()  // ends the subscription and removes the slot
+```
+
+- **The handler's promise is the ack.** `confirmed_flush_lsn` only advances past a
+  transaction once every handler for it has resolved, and only in commit order — so a
+  disconnect redelivers everything you had not finished. A handler that returns a
+  non-promise cannot be waited for and acks immediately; call `info.ack()` to confirm a
+  transaction explicitly (e.g. when you stop iterating early).
+- **A rejecting handler stalls the slot** rather than losing the transaction. That is
+  visible as a growing lag in `pg_replication_slots` — fix the consumer and restart, or
+  `info.ack()` to skip the transaction on purpose.
+- **An abandoned slot retains WAL forever.** Nothing drops a named slot for you: use
+  `subscription.drop()` (or `SELECT pg_drop_replication_slot(…)`) and consider bounding the
+  damage with the server's `max_slot_wal_keep_size`.
+- One slot streams to one connection: a second subscriber on the same name fails with the
+  server's *replication slot is active* error rather than silently splitting the stream.
+  The initial `subscribe()` rejects on that error (reconnects retry it with backoff), so
+  retry it yourself if you restart faster than the old walsender goes away.
+- Slot names are `[a-z0-9_]`, max 63 characters.
 
 ## Numbers, bigint, numeric
 

@@ -460,6 +460,7 @@ function parseOptions(a, b) {
     debug           : false,
     fetch_types     : true,
     publications    : 'alltables',
+    slot            : null,
     subscribe_high_water_mark: 1024,
     target_session_attrs: null
   }

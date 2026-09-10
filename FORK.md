@@ -51,7 +51,7 @@ The package name stays `postgres`, so imports don't change. Generated `cjs/`, `d
 `cf/` outputs are committed, and `prepare` rebuilds them, so git installs work directly:
 
 ```sh
-pnpm add 'postgres@github:<owner>/postgres#v3.7.3'
+pnpm add 'postgres@github:<owner>/postgres#v3.7.4'
 ```
 
 Upgrading an app = bump the tag in `package.json`, `pnpm install`. For a private repo, CI
@@ -61,7 +61,7 @@ Alternative for many projects / cleaner CI: publish as a scoped package and alia
 imports still resolve to `postgres`:
 
 ```sh
-pnpm add postgres@npm:@<owner>/postgres@3.7.3
+pnpm add postgres@npm:@<owner>/postgres@3.7.4
 ```
 
 ## Fork-specific behavior differences from upstream
@@ -90,3 +90,7 @@ pnpm add postgres@npm:@<owner>/postgres@3.7.3
 - `sql.end()` settles when a connection that was still connecting dies with nothing left to
   do (upstream parks it on a promise only `terminate()` resolves, so `end()` after a refused
   connection hangs forever on Node when a second connection was mid-connect).
+- `query.cancel()` returns the CancelRequest's promise (upstream drops it on a comma
+  operator and returns `null`). That promise rejects when the second connection the
+  CancelRequest needs cannot be opened; dropped, it is an unhandledRejection — fatal on
+  Node by default. Callers may ignore the return value as before.

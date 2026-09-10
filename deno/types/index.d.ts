@@ -670,7 +670,9 @@ declare namespace postgres {
     writable(): Promise<Writable>;
 
     execute(): this;
-    cancel(): void;
+    /** Resolves when the CancelRequest has been handled, rejects when the
+     * connection it needs cannot be opened; `undefined` once cancelled. */
+    cancel(): Promise<void> | void;
 
     /**
      * @deprecated `.stream` has been renamed to `.forEach`

@@ -50,7 +50,15 @@ export class Query extends Promise {
   }
 
   cancel() {
-    return this.canceller && (this.canceller(this), this.canceller = null)
+    if (!this.canceller)
+      return
+
+    // Hold the CancelRequest's promise and hand it back: it rejects when the
+    // second connection it needs cannot be opened, and a dropped rejection
+    // is an unhandledRejection — fatal in Node by default.
+    const cancelling = this.canceller(this)
+    this.canceller = null
+    return cancelling
   }
 
   simple() {

@@ -2839,6 +2839,30 @@ t('Cancel queued query', async() => {
   return ['57014', error.code]
 })
 
+t('Cancel returns the CancelRequest promise', async() => {
+  let cancelling
+  const query = sql`select pg_sleep(2) as nej`
+  const tx = sql.begin(sql => (
+    cancelling = query.cancel(),
+    sql`select pg_sleep(0.5) as hej, 'hejsa'`
+  ))
+  const error = await query.catch(x => x)
+  await tx
+  await cancelling
+  return ['57014 true', error.code + ' ' + (cancelling instanceof Promise)]
+})
+
+t('Cancel of a running query returns the CancelRequest promise', async() => {
+  let cancelling
+  const query = sql`select pg_sleep(2)`
+  setTimeout(() => (cancelling = query.cancel()), 200)
+  const error = await query.catch(x => x)
+  // Swallowed here, not dropped: an unhandled rejection from the second
+  // connection is fatal in Node by default.
+  await cancelling.catch(() => { /* noop */ })
+  return ['57014 true', error.code + ' ' + (cancelling instanceof Promise)]
+})
+
 t('Fragments', async() => [
   1,
   (await sql`

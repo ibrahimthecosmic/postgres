@@ -573,7 +573,14 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       initial && !initial.reserve && execute(initial)
       options.shared.retries = retries = 0
       initial = null
-      return
+
+      // execute() writes nothing for a query cancelled before it reached the
+      // wire, and isn't called at all for a reserve, so no further
+      // ReadyForQuery is coming. Fall through with nothing outstanding, or the
+      // connection strands in `connecting` — a lost pool slot, and a parked
+      // end() that only terminate() would have settled.
+      if (query || sent.length)
+        return
     }
 
     while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))

@@ -145,7 +145,10 @@ const Query = module.exports.Query = class Query extends Promise {
   }
 
   async handle() {
-    !this.executed && (this.executed = true) && await 1 && this.handler(this)
+    // A query cancelled before it was ever dispatched is already rejected, so
+    // don't hand it to the pool: nothing would be written, and the connection
+    // opened (or handed) to run it is left with no ReadyForQuery to release it.
+    !this.executed && (this.executed = true) && await 1 && !this.cancelled && this.handler(this)
   }
 
   execute() {

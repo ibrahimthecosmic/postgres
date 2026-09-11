@@ -1,5 +1,6 @@
 import { Buffer } from 'https://deno.land/std@0.132.0/node/buffer.ts'
 import process from 'https://deno.land/std@0.132.0/node/process.ts'
+import { setImmediate, clearImmediate } from '../polyfills.js'
 import { exec } from './bootstrap.js'
 
 import { t, nt, ot } from './test.js' // eslint-disable-line
@@ -2863,6 +2864,54 @@ t('Cancel of a running query returns the CancelRequest promise', async() => {
   return ['57014 true', error.code + ' ' + (cancelling instanceof Promise)]
 })
 
+t('Cancel while still connecting keeps the pool connection', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  const query = sql`select pg_sleep(2)`
+  query.execute()
+  // One macrotask is enough to have the query handed to a connection and
+  // parked as its `initial`, and too early for any handshake to have finished.
+  await new Promise(r => setImmediate(r))
+  await query.cancel()
+  const error = await query.catch(x => x)
+
+  return ['57014 1', error.code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
+t('End settles after cancelling a still connecting query', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  const query = sql`select pg_sleep(2)`
+  query.execute()
+  await new Promise(r => setImmediate(r))
+  await query.cancel()
+  const error = await query.catch(x => x)
+
+  // end() with the socket still connecting parks on a promise only
+  // terminate() settles.
+  return ['57014', error.code, await sql.end()]
+})
+
+t('Cancel before dispatch leaves the connection usable', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  await sql`select 1`
+  const query = sql`select pg_sleep(2)`
+  await query.cancel()
+  const error = await query.catch(x => x)
+
+  return ['57014 1', error.code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
+t('Cancel before dispatch inside a transaction', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  const x = await sql.begin(async sql => {
+    const query = sql`select 1`
+    await query.cancel()
+    await query.catch(() => { /* noop */ })
+    return (await sql`select 2 as x`)[0].x
+  })
+
+  return [2, x, await sql.end()]
+})
+
 t('Fragments', async() => [
   1,
   (await sql`
@@ -3256,6 +3305,15 @@ t('arrays in reserved connection', async() => {
     '123',
     x.join('')
   ]
+})
+
+t('reserve connection with fetch_types disabled', async() => {
+  const sql = postgres({ ...options, fetch_types: false }) // eslint-disable-line
+  const reserved = await sql.reserve()
+  const [{ x }] = await reserved`select 1 as x`
+  reserved.release()
+
+  return [1, x, await sql.end()]
 })
 
 t('Ensure reserve on query throws proper error', async() => {

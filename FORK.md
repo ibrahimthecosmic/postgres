@@ -51,7 +51,7 @@ The package name stays `postgres`, so imports don't change. Generated `cjs/`, `d
 `cf/` outputs are committed, and `prepare` rebuilds them, so git installs work directly:
 
 ```sh
-pnpm add 'postgres@github:<owner>/postgres#v3.7.4'
+pnpm add 'postgres@github:<owner>/postgres#v3.7.5'
 ```
 
 Upgrading an app = bump the tag in `package.json`, `pnpm install`. For a private repo, CI
@@ -61,7 +61,7 @@ Alternative for many projects / cleaner CI: publish as a scoped package and alia
 imports still resolve to `postgres`:
 
 ```sh
-pnpm add postgres@npm:@<owner>/postgres@3.7.4
+pnpm add postgres@npm:@<owner>/postgres@3.7.5
 ```
 
 ## Fork-specific behavior differences from upstream
@@ -94,3 +94,15 @@ pnpm add postgres@npm:@<owner>/postgres@3.7.4
   operator and returns `null`). That promise rejects when the second connection the
   CancelRequest needs cannot be opened; dropped, it is an unhandledRejection — fatal on
   Node by default. Callers may ignore the return value as before.
+- A query cancelled before it reached the wire no longer strands the connection it was
+  given. Upstream's `ReadyForQuery` returns right after `execute(initial)`, which writes
+  nothing for a cancelled query (and is skipped entirely for a `reserve`), so the
+  connection stays in the `connecting` queue with no further `ReadyForQuery` coming: the
+  pool loses a slot per occurrence (every query hangs after `max` of them) and an `end()`
+  awaited meanwhile is never settled. Also fixes `sql.reserve()` hanging forever with
+  `fetch_types: false`, which took the same early return.
+- `cancel()` on a query that was never dispatched leaves it rejected but no longer
+  dispatchable, so a later `then()`/`catch()` doesn't hand it to the pool. Upstream opens
+  (or takes) a connection to run nothing and parks it in the `full` queue — stuck for good
+  on an idle connection, and inside `sql.begin`/`sql.reserve` the rest of the scope's
+  queries stall behind it.

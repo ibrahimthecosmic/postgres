@@ -35,7 +35,8 @@ sql.subscribe('transaction', async (changes, info) => {
 2. **Lazy fire** — the callback fires on the first actual change, never on bare
    Begin/Stream Start: empty transactions and empty stream segments produce no event.
    The subscriber set is snapshotted at first change; late subscribers join at the next
-   transaction.
+   transaction. The one exception is `subscribe_tables` (§16): with a filter configured a
+   transaction that reached commit with nothing left fires at commit instead, empty.
 3. **Per-row events are disabled** — `subscribe()` accepts only `'transaction'`; any
    other event (`'*'`, `insert`, `update:users`, …) throws
    `Only the transaction event is supported in this fork`. Rationale: per-row events
@@ -126,6 +127,36 @@ sql.subscribe('transaction', async (changes, info) => {
       disconnected) can never stream again - `START_REPLICATION` fails with `55000` on
       every attempt. The connect drops it and creates it afresh, logs that, and reports
       `resumed: false`. Servers before PG 13 have no `wal_status` and never invalidate.
+
+16. **`subscribe_tables`** — an instance option restricting which relations are decoded:
+    an array of `schema.table` names, or a `(schema, table) => boolean` predicate. The
+    decision is taken once per relation, when the `R` (Relation) message arrives: a relation
+    that fails the test is remembered as `null` and its column list is not even read, so
+    `I`/`D`/`U` drop their message on the relation lookup, before `tuples()`. `T` (truncate)
+    keeps the relations that passed — one message can cover several tables — and is dropped
+    when none did. An oid that was never announced stays `undefined` and still throws, so a
+    protocol violation is not silently swallowed.
+    - Array entries must be schema qualified; an unqualified name throws at `postgres()`
+      time rather than silently matching nothing.
+    - A transaction whose changes were **all** filtered out still fires the handler — empty
+      change iterator, then commit — so a consumer tracking position still sees its commit
+      lsn, and a durable slot still gets its ack. This also means a genuinely empty
+      transaction (PG < 15 sends Begin/Commit for those) fires while a filter is configured.
+      Streamed transactions get the same treatment at Stream Commit.
+    - Why not a publication: a publication is server state shared by every consumer of the
+      slot, cannot differ per connection, and changing it at runtime would disturb every
+      other consumer. The motivating consumer is a relay holding one slot for many apps,
+      each watching a subset that changes as its live queries come and go.
+17. **`subscribe_raw`** — an instance option delivering every value as the text form
+    pgoutput sent it: `null` for SQL NULL, `undefined` for an unchanged TOASTed column, the
+    row still keyed by column name. Implemented as "no parser anywhere" — the parser map
+    handed to `parse()` is empty, so every column takes the text branch in `tuples()`, and
+    `transform.value.from` is dropped for the stream. `transform.column`/`transform.row`
+    still apply: they shape the row, they do not decode it. `relation.columns[i].type` (the
+    type oid) and `.atttypmod` already travel with the relation, so a consumer can parse
+    later, elsewhere — with *its* parsers and `transform`, not the relay's. Distinct from
+    `transform.raw`, which changes the row's shape (an array) and still parses each value;
+    with both set the row is an array of unparsed text.
 
 ## Protocol notes (pgoutput v2)
 

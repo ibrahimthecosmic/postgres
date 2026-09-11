@@ -5,6 +5,7 @@ module.exports = Subscribe;function Subscribe(postgres, options) {
       , state = {}
       , hwm = options.subscribe_high_water_mark || 1024
       , lwm = Math.ceil(hwm / 4)
+      , watched = tableFilter(options.subscribe_tables)
 
   let connection
     , stream
@@ -29,6 +30,15 @@ module.exports = Subscribe;function Subscribe(postgres, options) {
     onclose: reestablish,
     no_subscribe: true
   })
+
+  // subscribe_raw is exactly "no parser anywhere": an empty parser map leaves
+  // every column on the text branch in tuples(), and a value transform would
+  // undo that again. Column and row transforms still apply - they shape the
+  // row, they do not decode it.
+  const parsers = options.subscribe_raw ? {} : sql.options.parsers
+      , transform = options.subscribe_raw
+        ? { ...options.transform, value: {} }
+        : options.transform
 
   const end = sql.end
       , close = sql.close
@@ -238,7 +248,7 @@ module.exports = Subscribe;function Subscribe(postgres, options) {
 
     function data(x) {
       if (x[0] === 0x77) {
-        parse(x.subarray(25), state, sql.options.parsers, handle, options.transform)
+        parse(x.subarray(25), state, parsers, handle, transform, watched)
       } else if (x[0] === 0x6b) {
         // Nothing decoded is outstanding, so the server's walEnd is safe to confirm -
         // without this the slot would pin the WAL of every unpublished write.
@@ -265,13 +275,19 @@ module.exports = Subscribe;function Subscribe(postgres, options) {
     }
 
     function commit(b) {
+      // With subscribe_tables every change of a transaction can be filtered
+      // out before it ever reached handle(). Fire it anyway - empty iterator,
+      // then commit - so a consumer tracking position still sees its lsn.
+      tx === null && begun !== null && watched !== null && (tx = transaction(begun))
       tx && (tx.info.lsn = b.lsn, tx.info.date = b.date, tx.end())
       track(tx, b.end)
       tx = begun = null
     }
 
     function streamCommit(b) {
-      const t = txs.get(b.xid)
+      const t = txs.has(b.xid) || watched === null
+        ? txs.get(b.xid)
+        : transaction({ xid: b.xid, streaming: true, lsn: null, date: null })
       txs.delete(b.xid)
       t && (t.info.lsn = b.lsn, t.info.date = b.date, t.end())
       track(t, b.end)
@@ -605,19 +621,31 @@ function Lsn(x, i) {
   return x.readUInt32BE(i).toString(16).toUpperCase() + '/' + x.readUInt32BE(i + 4).toString(16).toUpperCase()
 }
 
-function parse(x, state, parsers, handle, transform) {
+function parse(x, state, parsers, handle, transform, watched) {
   const char = (acc, [k, v]) => (acc[k.charCodeAt(0)] = v, acc)
 
   Object.entries({
     R: x => {  // Relation
       let i = state.stream ? 5 : 1
-      const r = state[x.readUInt32BE(i)] = {
+      const oid = x.readUInt32BE(i)
+      const r = {
         schema: x.toString('utf8', i += 4, i = x.indexOf(0, i)) || 'pg_catalog',
         table: x.toString('utf8', i + 1, i = x.indexOf(0, i + 1)),
         columns: Array(x.readUInt16BE(i += 2)),
         keys: []
       }
       i += 2
+
+      // subscribe_tables: a relation that fails the test is remembered as null
+      // and its columns are never even read, so every later change to it is
+      // dropped before a single tuple is decoded. An oid we were never told
+      // about stays undefined and still throws.
+      if (watched !== null && !watched(r.schema, r.table)) {
+        state[oid] = null
+        return
+      }
+
+      state[oid] = r
 
       let columnIndex = 0
         , column
@@ -649,6 +677,9 @@ function parse(x, state, parsers, handle, transform) {
       let i = state.stream ? 5 : 1
       const xid = state.stream ? x.readUInt32BE(1) : state.xid
       const relation = state[x.readUInt32BE(i)]
+      if (relation === null) // subscribe_tables
+        return
+
       const { row } = tuples(x, relation.columns, i += 7, transform)
 
       handle(row, {
@@ -661,6 +692,9 @@ function parse(x, state, parsers, handle, transform) {
       let i = state.stream ? 5 : 1
       const xid = state.stream ? x.readUInt32BE(1) : state.xid
       const relation = state[x.readUInt32BE(i)]
+      if (relation === null) // subscribe_tables
+        return
+
       i += 4
       const key = x[i] === 75
       handle(key || x[i] === 79
@@ -677,6 +711,9 @@ function parse(x, state, parsers, handle, transform) {
       let i = state.stream ? 5 : 1
       const xid = state.stream ? x.readUInt32BE(1) : state.xid
       const relation = state[x.readUInt32BE(i)]
+      if (relation === null) // subscribe_tables
+        return
+
       i += 4
       const key = x[i] === 75
       const xs = key || x[i] === 79
@@ -705,9 +742,16 @@ function parse(x, state, parsers, handle, transform) {
         relations[r] = state[x.readUInt32BE(i)]
         i += 4
       }
+
+      // subscribe_tables: keep the relations that passed - one truncate can
+      // cover several tables - and drop the message when none did.
+      const kept = watched === null ? relations : relations.filter(x => x !== null)
+      if (kept.length === 0)
+        return
+
       handle(null, {
         command: 'truncate',
-        relations,
+        relations: kept,
         cascade: !!(flags & 1),
         restartIdentity: !!(flags & 2),
         xid
@@ -761,6 +805,25 @@ function tuples(x, columns, xi, transform) {
   }
 
   return { i: xi, row: transform.row.from ? transform.row.from(row) : row }
+}
+
+// subscribe_tables: an array of 'schema.table' names, or a predicate on
+// (schema, table). Returns null when unset - the fast path that decodes
+// everything the publication sends.
+function tableFilter(x) {
+  if (x === undefined || x === null)
+    return null
+
+  if (typeof x === 'function')
+    return (schema, table) => !!x(schema, table)
+
+  const tables = new Set(Array.isArray(x) ? x : [x])
+  tables.forEach(x => {
+    if (typeof x !== 'string' || x.indexOf('.') === -1)
+      throw new Error('subscribe_tables takes schema qualified names (public.users), got: ' + x)
+  })
+
+  return (schema, table) => tables.has(schema + '.' + table)
 }
 
 function parseEvent(x) {

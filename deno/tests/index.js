@@ -2451,6 +2451,136 @@ t('subscribe transaction streamed truncate', { timeout: 10 }, async() => {
   ]
 })
 
+t('subscribe transaction subscribe_tables', { timeout: 5 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    subscribe_tables: ['public.watched']
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const events = []
+
+  const { unsubscribe } = await sql.subscribe('transaction', async changes => {
+    const changed = []
+    events.push(changed)
+    for await (const c of changes) {
+      c.command === 'truncate'
+        ? changed.push(c.command, c.relations.map(r => r.table).join('+'))
+        : changed.push(c.command, c.relation.table, c.row.name)
+    }
+  })
+
+  await sql`create table watched (id serial primary key, name text)`
+  await sql`create table ignored (id serial primary key, name text)`
+  // PG < 15 sends begin/commit for the DDL above too - start counting after it
+  await delay(200)
+  events.length = 0
+
+  await sql.begin(async sql => {
+    await sql`insert into ignored (name) values ('Keynes')`
+  })
+
+  await sql.begin(async sql => {
+    await sql`insert into watched (name) values ('Murray')`
+    await sql`insert into ignored (name) values ('Marx')`
+    await sql`truncate watched, ignored`
+  })
+
+  await delay(200)
+  await unsubscribe()
+  return [
+    '|insert,watched,Murray,truncate,watched',
+    events.map(x => x.join(',')).join('|'),
+    await sql`drop table watched`,
+    await sql`drop table ignored`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe_tables takes a predicate', { timeout: 5 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    subscribe_tables: (schema, table) => schema === 'public' && table.startsWith('watched')
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const result = []
+
+  const { unsubscribe } = await sql.subscribe('transaction', async changes => {
+    for await (const c of changes)
+      result.push(c.relation.table, c.row.name)
+  })
+
+  await sql`create table watched_one (id serial primary key, name text)`
+  await sql`create table ignored (id serial primary key, name text)`
+  await delay(200)
+
+  await sql.begin(async sql => {
+    await sql`insert into ignored (name) values ('Keynes')`
+    await sql`insert into watched_one (name) values ('Murray')`
+  })
+
+  await delay(200)
+  await unsubscribe()
+  return [
+    'watched_one,Murray',
+    result.join(','),
+    await sql`drop table watched_one`,
+    await sql`drop table ignored`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe_tables requires schema qualified names', async() => {
+  let error
+  try {
+    postgres({ ...options, subscribe_tables: ['users'] })
+  } catch (e) {
+    error = e
+  }
+
+  return [true, /schema qualified/.test(error && error.message)]
+})
+
+t('subscribe transaction subscribe_raw', { timeout: 5 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    subscribe_raw: true
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const result = []
+  let columns
+
+  const { unsubscribe } = await sql.subscribe('transaction', async changes => {
+    for await (const c of changes) {
+      columns = c.relation.columns
+      result.push(typeof c.row.id, c.row.id, typeof c.row.n, c.row.n, c.row.name === null)
+    }
+  })
+
+  await sql`create table test (id serial primary key, n numeric, name text)`
+  await sql`insert into test (n, name) values (1.5, null)`
+  await delay(200)
+  await unsubscribe()
+
+  return [
+    'string,1,string,1.5,true|23,undefined',
+    result.join(',') + '|' + columns[0].type + ',' + typeof columns[0].parser,
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
 t('subscribe durable slot resumes from the confirmed lsn', { timeout: 20 }, async() => {
   const slot = 'postgresjs_test_durable'
   const sql = postgres({

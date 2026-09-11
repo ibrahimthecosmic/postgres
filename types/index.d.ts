@@ -133,6 +133,24 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    * @default 1024
    */
   subscribe_high_water_mark: number
+  /**
+   * Restricts which relations `sql.subscribe('transaction')` decodes: an array of
+   * schema qualified names, or a predicate on (schema, table). Changes to relations
+   * that fail the test are dropped before their tuples are decoded, and a transaction
+   * whose changes were all dropped still fires with an empty change iterator so its
+   * commit lsn is still seen.
+   * @default null (every relation the publication sends)
+   */
+  subscribe_tables: string[] | ((schema: string, table: string) => boolean) | null
+  /**
+   * Delivers replication values undecoded: every column holds the text form it
+   * arrived in (`null` for SQL NULL, `undefined` for an unchanged TOASTed column),
+   * keyed by column name as usual. `relation.columns[i].type` (the type oid) and
+   * `.atttypmod` travel with the relation, so values can be parsed later, elsewhere.
+   * Only relevant when calling `sql.subscribe('transaction')`.
+   * @default false
+   */
+  subscribe_raw: boolean
   onclose: (connId: number) => void;
   backoff: boolean | ((attemptNum: number) => number);
   max_lifetime: number | null;

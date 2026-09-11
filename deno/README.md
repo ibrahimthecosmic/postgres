@@ -923,8 +923,9 @@ Things to know:
   change — one message can cover several tables (multi-table truncate or FK `CASCADE`),
   listed in `relations`. Requires the publication to publish truncate (the default).
 - Callbacks can be invoked concurrently when large transactions interleave; order by
-  `info.lsn` if you need commit order. Empty transactions emit no event, and
-  `'transaction'` accepts no table/key filter.
+  `info.lsn` if you need commit order. Empty transactions emit no event (unless
+  `subscribe_tables` filtered every change away — below), and `'transaction'` accepts no
+  table/key filter in the event string.
 
 ### Durable slots (fork feature)
 
@@ -969,6 +970,40 @@ await subscription.drop()  // ends the subscription and removes the slot
   The initial `subscribe()` rejects on that error (reconnects retry it with backoff), so
   retry it yourself if you restart faster than the old walsender goes away.
 - Slot names are `[a-z0-9_]`, max 63 characters.
+
+### Filtering relations and raw values (fork feature)
+
+Two instance options shape what the replication stream costs you before anything reaches
+your handler. Both are aimed at consumers that forward or ignore most of what a publication
+sends — a relay, or an app watching a handful of tables in a database-wide publication.
+
+```js
+const sql = postgres({
+  publications    : 'alltables',
+  subscribe_tables: ['public.orders', 'public.order_lines'], // or (schema, table) => boolean
+  subscribe_raw   : true
+})
+```
+
+- **`subscribe_tables`** (default `null`) restricts which relations are decoded. A change to
+  a relation that fails the test is dropped as soon as its relation id is read — before a
+  single tuple is parsed — and a `truncate` keeps only the relations that passed (and is
+  dropped when none do). Names are schema qualified (`public.orders`); an unqualified name
+  throws. A publication is server state shared by every consumer of the slot, so this is the
+  place to narrow a stream per connection, or to change what you watch at runtime.
+
+  A transaction whose changes were *all* filtered out still fires the handler with an empty
+  change iterator, so a consumer tracking position still sees its commit `lsn` (and, on a
+  durable slot, still acks it).
+- **`subscribe_raw`** (default `false`) turns value parsing off: every column arrives as the
+  text form pgoutput sent — `null` for SQL NULL, `undefined` for an unchanged TOASTed column
+  — with the row still keyed by column name. `relation.columns[i].type` (the type oid) and
+  `.atttypmod` travel with the relation, so values can be parsed later, elsewhere, with the
+  parsers and `transform` of whoever ends up using them. Column and row transforms still
+  apply; only value decoding is skipped.
+
+  This is not `transform.raw`, which changes the row's *shape* (an array) and still parses
+  every value.
 
 ## Numbers, bigint, numeric
 

@@ -76,6 +76,16 @@ pnpm add postgres@npm:@<owner>/postgres@3.7.5
 - TRUNCATE is delivered to transaction iterators as
   `{ command: 'truncate', relations, cascade, restartIdentity, xid }` (upstream ignores it).
 - New option `subscribe_high_water_mark` (default 1024).
+- New options `subscribe_tables` and `subscribe_raw` for `sql.subscribe('transaction')`.
+  `subscribe_tables` (an array of `schema.table` names, or a `(schema, table) => boolean`)
+  drops changes to every other relation as soon as the relation id is read — before any tuple
+  is decoded — and narrows a `truncate` to the relations that passed; a transaction whose
+  changes were all filtered still fires with an empty iterator so its commit lsn is seen.
+  `subscribe_raw` delivers every value as the text form pgoutput sent (`null` for NULL,
+  `undefined` for an unchanged TOASTed column), keyed by column name, with the type oid and
+  `atttypmod` on the relation — parsing is left to whoever consumes the change. Both exist
+  for consumers that forward or ignore most of a publication (a relay fanning one slot out to
+  many apps): the publication is shared server state and cannot be narrowed per connection.
 - New option `slot` — a durable (named, non-TEMPORARY) replication slot. Streaming resumes
   from the slot's `confirmed_flush_lsn` on reconnect, so delivery becomes at-least-once
   instead of upstream's at-most-once. The slot only advances as the consumer acks

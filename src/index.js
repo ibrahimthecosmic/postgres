@@ -474,6 +474,8 @@ function parseOptions(a, b) {
     publications    : 'alltables',
     slot            : null,
     subscribe_high_water_mark: 1024,
+    subscribe_tables: null,
+    subscribe_raw   : false,
     target_session_attrs: null
   }
 

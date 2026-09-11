@@ -2909,6 +2909,53 @@ t('Cancel before dispatch inside a transaction', async() => {
   return [2, x, await sql.end()]
 })
 
+t('Cancel while queued behind a cursor in a transaction', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  let after
+  // A cursor parks the connection in `full` for its whole run, so anything
+  // dispatched while it walks lands in the transaction's own queue. Cancelling
+  // one of those wrote nothing, so the drain must skip it rather than spend the
+  // transaction's next turn on it - there is no further ReadyForQuery coming.
+  const error = await sql.begin(async sql => {
+    const walk = sql`select i from generate_series(1, 3) i`
+      .cursor(() => delay(20))
+      .execute()
+
+    await delay(25)
+    const query = sql`select 1 as one`
+    query.execute()
+    await new Promise(r => setImmediate(r))
+    await query.cancel()
+    await query.catch(() => { /* noop */ })
+
+    await walk
+    after = (await sql`select 2 as x`)[0].x
+  }).catch(x => x)
+
+  return ['57014 2', error.code + ' ' + after, await sql.end()]
+})
+
+t('Cancel while queued behind a cursor in a reserved connection', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  const reserved = await sql.reserve()
+  const walk = reserved`select i from generate_series(1, 3) i`
+    .cursor(() => delay(20))
+    .execute()
+
+  await delay(25)
+  const query = reserved`select 1 as one`
+  query.execute()
+  await new Promise(r => setImmediate(r))
+  await query.cancel()
+  await query.catch(() => { /* noop */ })
+
+  await walk
+  const x = (await reserved`select 2 as x`)[0].x
+  reserved.release()
+
+  return [2, x, await sql.end()]
+})
+
 t('Fragments', async() => [
   1,
   (await sql`

@@ -211,9 +211,7 @@ function Postgres(a, b) {
       })
 
     move(c, reserved)
-    c.reserved = () => queue.length
-      ? c.execute(queue.shift())
-      : move(c, reserved)
+    c.reserved = () => drain(c, queue) || move(c, reserved)
     c.reserved.release = true
 
     const sql = Sql(handler)
@@ -299,10 +297,25 @@ function Postgres(a, b) {
     function onexecute(c) {
       connection = c
       move(c, reserved)
-      c.reserved = () => queries.length
-        ? c.execute(queries.shift())
-        : move(c, reserved)
+      c.reserved = () => drain(c, queries) || move(c, reserved)
     }
+  }
+
+  // Dispatch the next statement a reserved scope parked in its own queue,
+  // skipping any that were cancelled while they sat there: execute() writes
+  // nothing for a cancelled query, so no further ReadyForQuery is coming and
+  // this drain is never called again - the scope would stall with the rest of
+  // its statements queued behind the one that was cancelled, its transaction
+  // still open. Returns false when the queue held nothing left to send.
+  function drain(c, queue) {
+    while (queue.length) {
+      const q = queue.shift()
+      if (!q.cancelled) {
+        c.execute(q)
+        return true
+      }
+    }
+    return false
   }
 
   function move(c, queue) {

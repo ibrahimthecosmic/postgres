@@ -106,3 +106,8 @@ pnpm add postgres@npm:@<owner>/postgres@3.7.5
   (or takes) a connection to run nothing and parks it in the `full` queue — stuck for good
   on an idle connection, and inside `sql.begin`/`sql.reserve` the rest of the scope's
   queries stall behind it.
+- A query cancelled while parked in a `sql.begin`/`sql.reserve` scope's own queue is skipped
+  when that queue is drained. Upstream spends the scope's next turn on it, and since nothing
+  was written for a cancelled query no further `ReadyForQuery` arrives: the scope stalls
+  forever with its remaining statements queued and its server-side transaction open. Any
+  cursor inside the scope is enough to park queries there.

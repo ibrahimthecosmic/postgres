@@ -2537,6 +2537,53 @@ t('subscribe_tables takes a predicate', { timeout: 5 }, async() => {
   ]
 })
 
+t('subscribe_tables predicate follows the set at runtime', { timeout: 5 }, async() => {
+  const watched = new Set(['public.watched_one'])
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    subscribe_tables: (schema, table) => watched.has(schema + '.' + table)
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const result = []
+
+  const { unsubscribe } = await sql.subscribe('transaction', async changes => {
+    for await (const c of changes)
+      result.push(c.relation.table + ':' + c.row.name)
+  })
+
+  await sql`create table watched_one (id serial primary key, name text)`
+  await sql`create table later (id serial primary key, name text)`
+  await delay(200)
+
+  // `later` is announced (R) while it fails the test, and pgoutput announces
+  // it only once per session - so a remembered verdict would make the widening
+  // below silently permanent.
+  await sql`insert into later (name) values ('Keynes')`
+  await delay(200)
+
+  watched.add('public.later')
+  await sql`insert into later (name) values ('Murray')`
+  await delay(200)
+
+  watched.delete('public.later')
+  await sql`insert into later (name) values ('Marx')`
+  await sql`insert into watched_one (name) values ('Menger')`
+  await delay(200)
+
+  await unsubscribe()
+  return [
+    'later:Murray,watched_one:Menger',
+    result.join(','),
+    await sql`drop table watched_one`,
+    await sql`drop table later`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
 t('subscribe_tables requires schema qualified names', async() => {
   let error
   try {

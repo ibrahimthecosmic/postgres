@@ -61,7 +61,7 @@ Alternative for many projects / cleaner CI: publish as a scoped package and alia
 imports still resolve to `postgres`:
 
 ```sh
-pnpm add postgres@npm:@<owner>/postgres@3.8.0
+pnpm add postgres@npm:@<owner>/postgres@3.8.1
 ```
 
 ## Fork-specific behavior differences from upstream
@@ -81,6 +81,8 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.0
   drops changes to every other relation as soon as the relation id is read — before any tuple
   is decoded — and narrows a `truncate` to the relations that passed; a transaction whose
   changes were all filtered still fires with an empty iterator so its commit lsn is seen.
+  An array is resolved once per relation and remembered; a predicate is asked per change, so
+  a consumer can widen or narrow what it watches at runtime and the next change obeys.
   `subscribe_raw` delivers every value as the text form pgoutput sent (`null` for NULL,
   `undefined` for an unchanged TOASTed column), keyed by column name, with the type oid and
   `atttypmod` on the relation — parsing is left to whoever consumes the change. Both exist

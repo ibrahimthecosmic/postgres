@@ -994,7 +994,15 @@ const sql = postgres({
   single tuple is parsed — and a `truncate` keeps only the relations that passed (and is
   dropped when none do). Names are schema qualified (`public.orders`); an unqualified name
   throws. A publication is server state shared by every consumer of the slot, so this is the
-  place to narrow a stream per connection, or to change what you watch at runtime.
+  place to narrow a stream per connection.
+
+  **An array is a constant; a predicate is a live question.** A list is resolved once per
+  relation — when pgoutput announces it — and costs nothing afterwards. A function is asked
+  again for *every* change, so a predicate reading mutable state (the tables your app cares
+  about right now) is how you change what you watch at runtime: the next change to a table
+  you just added is delivered, even though its relation was announced long before. pgoutput
+  announces each relation only once per session, so a remembered verdict could never do
+  that.
 
   A transaction whose changes were *all* filtered out still fires the handler with an empty
   change iterator, so a consumer tracking position still sees its commit `lsn` (and, on a

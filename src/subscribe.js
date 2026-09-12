@@ -624,6 +624,19 @@ function Lsn(x, i) {
 function parse(x, state, parsers, handle, transform, watched) {
   const char = (acc, [k, v]) => (acc[k.charCodeAt(0)] = v, acc)
 
+  // The relation a change refers to, or null when subscribe_tables excludes
+  // it. A predicate is re-asked here, for every change, because the consumer
+  // may have widened what it watches since this relation was announced -
+  // pgoutput sends R once per relation per session, so a remembered verdict
+  // would silently drop changes to a table that became interesting later.
+  // An oid we were never told about stays undefined and still throws.
+  const target = watched !== null && watched.dynamic
+    ? oid => {
+      const r = state[oid]
+      return r && !watched(r.schema, r.table) ? null : r
+    }
+    : oid => state[oid]
+
   Object.entries({
     R: x => {  // Relation
       let i = state.stream ? 5 : 1
@@ -636,11 +649,12 @@ function parse(x, state, parsers, handle, transform, watched) {
       }
       i += 2
 
-      // subscribe_tables: a relation that fails the test is remembered as null
-      // and its columns are never even read, so every later change to it is
-      // dropped before a single tuple is decoded. An oid we were never told
-      // about stays undefined and still throws.
-      if (watched !== null && !watched(r.schema, r.table)) {
+      // subscribe_tables, array form: the test is a constant, so a relation
+      // that fails it is remembered as null and its columns are never even
+      // read - every later change to it is dropped before a single tuple is
+      // decoded. A predicate is asked per change instead (target() above),
+      // so the relation is kept even when it currently fails.
+      if (watched !== null && !watched.dynamic && !watched(r.schema, r.table)) {
         state[oid] = null
         return
       }
@@ -676,7 +690,7 @@ function parse(x, state, parsers, handle, transform, watched) {
     I: x => { // Insert
       let i = state.stream ? 5 : 1
       const xid = state.stream ? x.readUInt32BE(1) : state.xid
-      const relation = state[x.readUInt32BE(i)]
+      const relation = target(x.readUInt32BE(i))
       if (relation === null) // subscribe_tables
         return
 
@@ -691,7 +705,7 @@ function parse(x, state, parsers, handle, transform, watched) {
     D: x => { // Delete
       let i = state.stream ? 5 : 1
       const xid = state.stream ? x.readUInt32BE(1) : state.xid
-      const relation = state[x.readUInt32BE(i)]
+      const relation = target(x.readUInt32BE(i))
       if (relation === null) // subscribe_tables
         return
 
@@ -710,7 +724,7 @@ function parse(x, state, parsers, handle, transform, watched) {
     U: x => { // Update
       let i = state.stream ? 5 : 1
       const xid = state.stream ? x.readUInt32BE(1) : state.xid
-      const relation = state[x.readUInt32BE(i)]
+      const relation = target(x.readUInt32BE(i))
       if (relation === null) // subscribe_tables
         return
 
@@ -739,7 +753,7 @@ function parse(x, state, parsers, handle, transform, watched) {
       const flags = x[i += 4]
       i += 1
       for (let r = 0; r < relations.length; r++) {
-        relations[r] = state[x.readUInt32BE(i)]
+        relations[r] = target(x.readUInt32BE(i))
         i += 4
       }
 
@@ -814,8 +828,14 @@ function tableFilter(x) {
   if (x === undefined || x === null)
     return null
 
-  if (typeof x === 'function')
-    return (schema, table) => !!x(schema, table)
+  // A predicate is a live question: parse() asks it per change, so widening
+  // what you watch takes effect on the very next change. An array is a
+  // constant - its verdict is remembered per relation and costs nothing.
+  if (typeof x === 'function') {
+    const test = (schema, table) => !!x(schema, table)
+    test.dynamic = true
+    return test
+  }
 
   const tables = new Set(Array.isArray(x) ? x : [x])
   tables.forEach(x => {

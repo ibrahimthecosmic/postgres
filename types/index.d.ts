@@ -138,7 +138,8 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    * schema qualified names, or a predicate on (schema, table). Changes to relations
    * that fail the test are dropped before their tuples are decoded, and a transaction
    * whose changes were all dropped still fires with an empty change iterator so its
-   * commit lsn is still seen.
+   * commit lsn is still seen. An array is resolved once per relation; a predicate is
+   * asked per change, so it can follow what the consumer watches at runtime.
    * @default null (every relation the publication sends)
    */
   subscribe_tables: string[] | ((schema: string, table: string) => boolean) | null

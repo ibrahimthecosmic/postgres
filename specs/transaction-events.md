@@ -12,14 +12,14 @@ being buffered server-side until commit.
 const sql = postgres({ publications: 'alltables', subscribe_high_water_mark: 1024 })
 
 sql.subscribe('transaction', async (changes, info) => {
-  // info: { xid: number, streaming: boolean, lsn: string|null, date: Date|null }
+  // info: { xid: number, streaming: boolean, lsn: string|null, end: string|null, date: Date|null }
   try {
     for await (const c of changes) {
       // c: { command: 'insert'|'update'|'delete', row, old, relation, xid }
       //  | { command: 'truncate', relations, cascade, restartIdentity, xid }
       //  | { command: 'abort', xid }   ← subtransaction rollback marker
     }
-    // iterator ended = COMMIT; info.lsn ('X/XXXXXXXX') and info.date are now set
+    // iterator ended = COMMIT; info.lsn, info.end ('X/XXXXXXXX') and info.date are now set
   } catch (err) {
     // whole-transaction abort OR connection loss — discard/rollback local work
   }
@@ -80,7 +80,8 @@ sql.subscribe('transaction', async (changes, info) => {
    `streaming` option). The fallback assembles Begin..Commit in memory: same API,
    `info.streaming === false` always.
 11. **LSN format** — `'X/XXXXXXXX'` uppercase unpadded (Postgres `%X/%X`), e.g.
-    `16/B374D848`. `info.lsn`/`info.date` are null until commit.
+    `16/B374D848`. `info.lsn`/`info.end`/`info.date` are null until commit; `info.end` is
+    the commit record's end LSN, the position a durable slot confirms for the transaction.
 12. **Ack discipline** — with a temporary slot, unchanged from upstream (keepalive walEnd /
     Begin final_lsn is acked before delivery). Safe only because the slot is TEMPORARY —
     there is never a replay. With a durable slot the flushed/applied positions are

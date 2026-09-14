@@ -10,6 +10,7 @@ export default function Subscribe(postgres, options) {
   let connection
     , stream
     , flush
+    , position
     , resumed = false
     , durable = !!options.slot
     , slot = options.slot || 'postgresjs_' + Math.random().toString(36).slice(2)
@@ -128,7 +129,7 @@ export default function Subscribe(postgres, options) {
       connected(x)
       onsubscribe(info())
       stream && stream.on('error', onerror)
-      return { unsubscribe, drop, state, sql, get slot() { return slot } }
+      return { unsubscribe, drop, state, sql, get slot() { return slot }, get position() { return position ? position() : null } }
     })
   }
 
@@ -182,6 +183,7 @@ export default function Subscribe(postgres, options) {
   function connected(x) {
     stream = x.stream
     flush = x.flush
+    position = x.position
     resumed = x.resumed
     state.pid = x.state.pid
     state.secret = x.state.secret
@@ -230,7 +232,9 @@ export default function Subscribe(postgres, options) {
     stream.on('close', teardown)
     stream.on('close', reestablish)
 
-    return { stream, state: xs.state, flush, resumed }
+    // The position this stream reports as flushed/applied on its next
+    // status update - a durable slot resumes exactly here.
+    return { stream, state: xs.state, flush, resumed, position: () => Lsn(durable ? acked : state.lsn, 0) }
 
     // Send a scheduled ack now rather than losing it to the close - anything
     // acked but unconfirmed would simply be redelivered on the next connect.
@@ -270,7 +274,7 @@ export default function Subscribe(postgres, options) {
     }
 
     function begin(b) {
-      begun = { xid: b.xid, streaming: false, lsn: null, date: null }
+      begun = { xid: b.xid, streaming: false, lsn: null, end: null, date: null }
       tx = null
     }
 
@@ -279,7 +283,7 @@ export default function Subscribe(postgres, options) {
       // out before it ever reached handle(). Fire it anyway - empty iterator,
       // then commit - so a consumer tracking position still sees its lsn.
       tx === null && begun !== null && watched !== null && (tx = transaction(begun))
-      tx && (tx.info.lsn = b.lsn, tx.info.date = b.date, tx.end())
+      tx && (tx.info.lsn = b.lsn, tx.info.end = b.endLsn, tx.info.date = b.date, tx.end())
       track(tx, b.end)
       tx = begun = null
     }
@@ -287,9 +291,9 @@ export default function Subscribe(postgres, options) {
     function streamCommit(b) {
       const t = txs.has(b.xid) || watched === null
         ? txs.get(b.xid)
-        : transaction({ xid: b.xid, streaming: true, lsn: null, date: null })
+        : transaction({ xid: b.xid, streaming: true, lsn: null, end: null, date: null })
       txs.delete(b.xid)
-      t && (t.info.lsn = b.lsn, t.info.date = b.date, t.end())
+      t && (t.info.lsn = b.lsn, t.info.end = b.endLsn, t.info.date = b.date, t.end())
       track(t, b.end)
     }
 
@@ -306,7 +310,7 @@ export default function Subscribe(postgres, options) {
 
     function streamed(a, b) {
       let t = txs.get(state.stream)
-      t === undefined && txs.set(state.stream, t = transaction({ xid: state.stream, streaming: true, lsn: null, date: null }))
+      t === undefined && txs.set(state.stream, t = transaction({ xid: state.stream, streaming: true, lsn: null, end: null, date: null }))
       t && t.push(change(a, b))
     }
 
@@ -778,13 +782,13 @@ function parse(x, state, parsers, handle, transform, watched) {
       state.stream = null
     },
     c: x => { // Stream Commit
-      handle(null, { command: 'stream_commit', xid: x.readUInt32BE(1), lsn: Lsn(x, 6), end: x.subarray(14, 22), date: Time(x.readBigInt64BE(22)) })
+      handle(null, { command: 'stream_commit', xid: x.readUInt32BE(1), lsn: Lsn(x, 6), end: x.subarray(14, 22), endLsn: Lsn(x, 14), date: Time(x.readBigInt64BE(22)) })
     },
     A: x => { // Stream Abort
       handle(null, { command: 'stream_abort', xid: x.readUInt32BE(1), subxid: x.readUInt32BE(5) })
     },
     C: x => { // Commit
-      handle(null, { command: 'commit', lsn: Lsn(x, 2), end: x.subarray(10, 18), date: Time(x.readBigInt64BE(18)) })
+      handle(null, { command: 'commit', lsn: Lsn(x, 2), end: x.subarray(10, 18), endLsn: Lsn(x, 10), date: Time(x.readBigInt64BE(18)) })
     }
   }).reduce(char, {})[x[0]](x)
 }

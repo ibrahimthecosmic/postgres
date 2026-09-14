@@ -51,7 +51,7 @@ The package name stays `postgres`, so imports don't change. Generated `cjs/`, `d
 `cf/` outputs are committed, and `prepare` rebuilds them, so git installs work directly:
 
 ```sh
-pnpm add 'postgres@github:<owner>/postgres#v3.8.0'
+pnpm add 'postgres@github:<owner>/postgres#v3.8.2'
 ```
 
 Upgrading an app = bump the tag in `package.json`, `pnpm install`. For a private repo, CI
@@ -61,7 +61,7 @@ Alternative for many projects / cleaner CI: publish as a scoped package and alia
 imports still resolve to `postgres`:
 
 ```sh
-pnpm add postgres@npm:@<owner>/postgres@3.8.1
+pnpm add postgres@npm:@<owner>/postgres@3.8.2
 ```
 
 ## Fork-specific behavior differences from upstream
@@ -76,6 +76,12 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.1
 - TRUNCATE is delivered to transaction iterators as
   `{ command: 'truncate', relations, cascade, restartIdentity, xid }` (upstream ignores it).
 - New option `subscribe_high_water_mark` (default 1024).
+- `TransactionInfo.end` (3.8.2): the commit record's end LSN — exactly what a durable
+  slot confirms for the transaction, so a consumer that records resume points records
+  the position the slot itself will resume from. `info.lsn` stays the commit LSN.
+- `SubscriptionHandle.position` (3.8.2): the position the stream confirms on its next
+  status update (the durable slot's resume point, keepalive advances included), so a
+  consumer that hands out resume points can hand out exactly what the slot will honor.
 - New options `subscribe_tables` and `subscribe_raw` for `sql.subscribe('transaction')`.
   `subscribe_tables` (an array of `schema.table` names, or a `(schema, table) => boolean`)
   drops changes to every other relation as soon as the relation id is read — before any tuple

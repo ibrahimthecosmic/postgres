@@ -541,6 +541,11 @@ declare namespace postgres {
     streaming: boolean;
     /** Commit LSN as 'X/XXXXXXXX'; null until the transaction commits */
     lsn: string | null;
+    /**
+     * End LSN of the commit record as 'X/XXXXXXXX' - the position a durable slot
+     * confirms for this transaction (its resume point); null until the transaction commits
+     */
+    end: string | null;
     /** Commit timestamp; null until the transaction commits */
     date: Date | null;
     /**
@@ -559,6 +564,13 @@ declare namespace postgres {
     drop(): Promise<void>;
     /** Name of the replication slot currently streaming */
     readonly slot: string;
+    /**
+     * The position ('X/XXXXXXXX') the stream reports as flushed and applied on its next
+     * status update - on a durable slot, exactly where the slot resumes after a
+     * disconnect (every transaction up to it has been handled; keepalives advance it
+     * across quiet stretches). Null before the stream is established.
+     */
+    readonly position: string | null;
   }
 
   interface SubscribeOptions {

@@ -540,7 +540,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (query) {
       if (errorResponse) {
         query.retried
-          ? errored(query.retried)
+          ? errored(Object.assign(errorResponse, { cause: query.retried }))
           : query.prepared && retryRoutines.has(errorResponse.routine)
             ? retry(query, errorResponse)
             : errored(errorResponse)
@@ -829,6 +829,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     }
   }
 
+  // A cached plan the server invalidated is re-prepared and run again. If
+  // that second run fails, the error to report is the one it hit — not the
+  // stale-plan error that caused the retry, which is an internal detail the
+  // caller did not cause. The trigger stays reachable as `cause`.
   function retry(q, error) {
     delete statements[q.signature]
     q.retried = error

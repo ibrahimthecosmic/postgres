@@ -51,7 +51,7 @@ The package name stays `postgres`, so imports don't change. Generated `cjs/`, `d
 `cf/` outputs are committed, and `prepare` rebuilds them, so git installs work directly:
 
 ```sh
-pnpm add 'postgres@github:<owner>/postgres#v3.8.2'
+pnpm add 'postgres@github:<owner>/postgres#v3.8.3'
 ```
 
 Upgrading an app = bump the tag in `package.json`, `pnpm install`. For a private repo, CI
@@ -61,7 +61,7 @@ Alternative for many projects / cleaner CI: publish as a scoped package and alia
 imports still resolve to `postgres`:
 
 ```sh
-pnpm add postgres@npm:@<owner>/postgres@3.8.2
+pnpm add postgres@npm:@<owner>/postgres@3.8.3
 ```
 
 ## Fork-specific behavior differences from upstream
@@ -82,6 +82,12 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.2
 - `SubscriptionHandle.position` (3.8.2): the position the stream confirms on its next
   status update (the durable slot's resume point, keepalive advances included), so a
   consumer that hands out resume points can hand out exactly what the slot will honor.
+- A **failed retry reports its own error** (3.8.3). A prepared statement whose cached plan
+  the server invalidated is re-prepared and run again; upstream answers a second failure
+  with the error that *triggered* the retry, so a `0A000` "cached plan must not change
+  result type" masked whatever the re-run actually hit — a `22001` the caller's own data
+  caused, for instance. The retry's error is now what surfaces, with the trigger kept as
+  `error.cause`. Only the failing-retry path changes; a retry that succeeds is unaffected.
 - New options `subscribe_tables` and `subscribe_raw` for `sql.subscribe('transaction')`.
   `subscribe_tables` (an array of `schema.table` names, or a `(schema, table) => boolean`)
   drops changes to every other relation as soon as the relation id is read — before any tuple

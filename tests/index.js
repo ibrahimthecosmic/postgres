@@ -1824,6 +1824,23 @@ t('Recreate prepared statements on RevalidateCachedQuery error', async() => {
   ]
 })
 
+t('A failed retry reports its own error, the trigger as cause', async() => {
+  await sql`create table test (id int, v varchar(10))`
+  const insert = (id, v) => sql`insert into test (id, v) values (${ id }, ${ v }) returning *`
+  await insert(1, 'ok')
+  // `returning *` changes shape, so the cached plan is invalidated and the
+  // next execution of the same statement retries.
+  await sql`alter table test add column w int`
+  // The re-prepared run fails on the value. That is the caller's error; the
+  // stale-plan error that triggered the retry is an internal detail.
+  const error = await insert(2, 'x'.repeat(50)).catch(e => e)
+  return [
+    '22001 0A000',
+    error.code + ' ' + (error.cause && error.cause.code),
+    await sql`drop table test`
+  ]
+})
+
 t('Properly throws routine error on not prepared statements', async() => {
   await sql`create table x (x text[])`
   const { routine } = await sql.unsafe(`

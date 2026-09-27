@@ -3444,6 +3444,56 @@ t('A backend terminated partway through its rows leaves the next result whole', 
   return ['1 1', result.length + ' ' + (result[0] && result[0].x), await sql.end()]
 })
 
+t('A transaction whose backend is terminated rejects and leaves the pool usable', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  const error = await sql.begin(async sql => {
+    const [{ pid }] = await sql`select pg_backend_pid() as pid`
+    const query = sql`select pg_sleep(2)`.execute()
+    await running(pid)
+    await terminate(pid)
+    await query
+  }).catch(e => e)
+
+  return ['CONNECTION_CLOSED 1', error.code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
+t('A transaction sends nothing more once its connection closed', async() => {
+  const notices = []
+  const sql = postgres({ ...options, onnotice: x => notices.push(x.code) }) // eslint-disable-line
+  let done
+  const finished = new Promise(r => done = r)
+
+  const error = await sql.begin(async tx => {
+    const [{ pid }] = await tx`select pg_backend_pid() as pid`
+    const query = tx`select pg_sleep(2)`.execute()
+    await running(pid)
+    await terminate(pid)
+    await query.catch(() => { /* terminated */ })
+    // The pool reopens the connection for this query. Neither a statement of
+    // the transaction nor the commit that returning sends may follow it into
+    // that new session.
+    await sql`select 1`
+    done(await tx`select 1 as x`.catch(e => e.code))
+  }).catch(e => e)
+
+  const late = await finished
+  await sql`select 1` // a commit sent to the new session has been answered by now
+  return ['CONNECTION_CLOSED CONNECTION_CLOSED 0', error.code + ' ' + late + ' ' + notices.length, await sql.end()]
+})
+
+t('A reserved connection that closed fails its queries, and releasing it keeps the pool usable', async() => {
+  let onclose
+  const closed = new Promise(r => onclose = r)
+  const sql = postgres({ ...options, onclose }) // eslint-disable-line
+  const reserved = await sql.reserve()
+  const [{ pid }] = await reserved`select pg_backend_pid() as pid`
+  await terminate(pid, closed)
+  const error = await reserved`select 1`.catch(e => e)
+  reserved.release()
+
+  return ['CONNECTION_CLOSED 1', error.code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
 t('Custom socket', {}, async() => {
   let result
   const sql = postgres({

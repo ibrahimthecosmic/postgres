@@ -210,12 +210,17 @@ function Postgres(a, b) {
         closed.length && connect(closed.shift(), query)
       })
 
+    let lost = null
     move(c, reserved)
     c.reserved = () => drain(c, queue) || move(c, reserved)
     c.reserved.release = true
+    c.onclose = e => lost = fail(queue, e)
 
     const sql = Sql(handler)
     sql.release = () => {
+      // A closed connection went back to the pool when it closed.
+      if (lost)
+        return
       c.reserved = null
       onopen(c)
     }
@@ -223,9 +228,11 @@ function Postgres(a, b) {
     return sql
 
     function handler(q) {
-      c.queue === full
-        ? queue.push(q)
-        : c.execute(q) || move(c, full)
+      lost
+        ? q.reject(lost)
+        : c.queue === full
+          ? queue.push(q)
+          : c.execute(q) || move(c, full)
     }
   }
 
@@ -234,13 +241,14 @@ function Postgres(a, b) {
     const queries = Queue()
     let savepoints = 0
       , connection
+      , lost = null
       , prepare = null
 
     try {
       await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
       return await Promise.race([
         scope(connection, fn),
-        new Promise((_, reject) => connection.onclose = reject)
+        new Promise((_, reject) => connection.onclose = e => reject(lost = fail(queries, e)))
       ])
     } catch (error) {
       throw error
@@ -263,7 +271,8 @@ function Postgres(a, b) {
         if (uncaughtError)
           throw uncaughtError
       } catch (e) {
-        await (name
+        // A transaction whose connection closed was rolled back by the server.
+        lost || await (name
           ? sql`rollback to ${ sql(name) }`
           : sql`rollback`
         )
@@ -288,9 +297,11 @@ function Postgres(a, b) {
 
       function handler(q) {
         q.catch(e => uncaughtError || (uncaughtError = e))
-        c.queue === full
-          ? queries.push(q)
-          : c.execute(q) || move(c, full)
+        lost
+          ? q.reject(lost)
+          : c.queue === full
+            ? queries.push(q)
+            : c.execute(q) || move(c, full)
       }
     }
 
@@ -299,6 +310,18 @@ function Postgres(a, b) {
       move(c, reserved)
       c.reserved = () => drain(c, queries) || move(c, reserved)
     }
+  }
+
+  // The connection of a begin/reserve scope closed. The pool took it back and
+  // may already be reopening it for someone else, so nothing the scope sends
+  // from now on may reach it - no statement, and no commit or rollback, which
+  // would land in a different session. Fail what the scope has parked in its
+  // own queue (nothing else would ever drain it) and hand back the error that
+  // everything it sends from here on fails with.
+  function fail(queue, error) {
+    while (queue.length)
+      queue.shift().reject(error)
+    return error
   }
 
   // Dispatch the next statement a reserved scope parked in its own queue,

@@ -159,6 +159,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (terminated)
       return queryError(q, Errors.connection('CONNECTION_DESTROYED', options))
 
+    // Only a caller holding on to a connection that has since closed gets
+    // here; queued, the query would be answered by whatever reopens it.
+    if (!socket)
+      return queryError(q, Errors.connection('CONNECTION_CLOSED', options))
+
     if (stream)
       return queryError(q, Errors.generic('COPY_IN_PROGRESS', 'You cannot execute queries during copy'))
 
@@ -246,6 +251,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function write(x, fn) {
+    // closed() has failed everything that was waiting on a socket that is
+    // gone. A write for it that turns up later - an auth step still awaiting
+    // the password function, say - would throw in nextWrite, outside any
+    // promise, and take the process down.
+    if (!socket)
+      return false
+
     chunk = chunk ? Buffer.concat([chunk, x]) : Buffer.from(x)
     if (fn || chunk.length >= 1024)
       return nextWrite(fn)

@@ -154,3 +154,11 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.3
   whose callback outlives its connection no longer writes to the dead socket once the
   callback returns, nor to the reopened one that now serves another query. Upstream
   crashes the process there, with a TypeError outside any promise.
+- **`sql.begin` and `sql.reserve` send nothing once their connection closed** (3.8.4). The
+  pool takes the connection back and may reopen it for someone else. A transaction or
+  reserved handle whose connection died now rejects what it had queued and everything it
+  sends afterwards, commit and rollback included. `release()` of such a handle is a no-op.
+  Upstream queued the transaction's rollback onto the closed connection and crashed the
+  process (an uncaught TypeError in `nextWrite`). Once the pool had reopened the
+  connection, it ran the handle's statements, and even its commit or rollback, in a
+  different session. Releasing a dead reserved connection broke the pool for good.

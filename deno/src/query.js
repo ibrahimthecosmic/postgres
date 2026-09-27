@@ -92,9 +92,17 @@ export class Query extends Promise {
       return (this.cursorFn = fn, this)
 
     let prev
+      , error = null
     return {
       [Symbol.asyncIterator]: () => ({
         next: () => {
+          // An error that lands between two next() calls - the connection
+          // dying while the caller works on a batch - finds the promise it
+          // would reject already resolved with that batch. Keep it for the
+          // calls that follow, or the iteration ends as if every row was read.
+          if (error)
+            return Promise.reject(error)
+
           if (this.executed && !this.active)
             return { done: true }
 
@@ -105,7 +113,7 @@ export class Query extends Promise {
               return new Promise(r => prev = r)
             }
             this.resolve = () => (this.active = false, resolve({ done: true }))
-            this.reject = x => (this.active = false, reject(x))
+            this.reject = x => (this.active = false, error || (error = x), reject(x))
           })
           this.execute()
           return promise

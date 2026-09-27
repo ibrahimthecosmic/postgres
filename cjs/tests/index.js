@@ -1457,6 +1457,46 @@ t('Async Iterator Cursor custom with less results than batch size', async() => {
   return ['20', order.join(',')]
 })
 
+t('Async Iterator Cursor throws when its connection dies between batches', async() => {
+  let onclose
+  const closed = new Promise(r => onclose = r)
+  const sql = postgres({ ...options, onclose }) // eslint-disable-line
+  const [{ pid }] = await sql`select pg_backend_pid() as pid`
+  let rows = 0
+
+  // The batch has been handed over when the connection dies, so there is no
+  // pending promise for the error to reject - the next step has to throw it.
+  const error = await (async() => {
+    for await (const xs of sql`select * from generate_series(1, 10)`.cursor(2)) {
+      rows += xs.length
+      rows === 2 && await terminate(pid, closed)
+    }
+  })().catch(e => e)
+
+  return ['57P01 2', error && error.code + ' ' + rows, await sql.end()]
+})
+
+t('Cursor callback that outlives its connection touches nothing after it', async() => {
+  let onclose
+  const closed = new Promise(r => onclose = r)
+  const sql = postgres({ ...options, onclose }) // eslint-disable-line
+  const [{ pid }] = await sql`select pg_backend_pid() as pid`
+  let rows = 0
+    , reopened
+  const next = new Promise(r => reopened = r)
+
+  // The cursor fails while its callback still runs, and the query below
+  // reopens the connection before the callback returns. After it returns, the
+  // cursor must leave both the dead socket and the reopened one alone.
+  const error = await sql`select * from generate_series(1, 10)`.cursor(2, async xs => {
+    rows += xs.length
+    rows === 2 && (await terminate(pid, closed), reopened(sql`select 1 as x`.execute()))
+  }).catch(e => e)
+
+  const [{ x }] = await next
+  return ['57P01 2 1', error.code + ' ' + rows + ' ' + x, await sql.end()]
+})
+
 t('Transform row', async() => {
   const sql = postgres({
     ...options,

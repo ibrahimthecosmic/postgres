@@ -888,15 +888,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   async function PortalSuspended() {
+    const q = query
     try {
-      const x = await Promise.resolve(query.cursorFn(result))
+      const x = await Promise.resolve(q.cursorFn(result))
+      // The connection closed while the cursor's consumer had the batch: q
+      // failed with it, and whatever is current now - on a reopened socket -
+      // is some other query's, so neither the connection's state nor its
+      // socket is q's to touch.
+      if (q !== query)
+        return
       rows = 0
       x === CLOSE
-        ? write(Close(query.portal))
-        : (result = new Result(), write(Execute('', query.cursorRows)))
+        ? write(Close(q.portal))
+        : (result = new Result(), write(Execute('', q.cursorRows)))
     } catch (err) {
-      write(Sync)
-      query.reject(err)
+      q === query && write(Sync)
+      q.reject(err)
     }
   }
 

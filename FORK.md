@@ -148,3 +148,9 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.3
   rows offset by that many, so its result started with holes: ``const [row] = await sql`…` ``
   read `undefined`. This needs no connection fault, any error mid-stream is enough (a
   division by zero in row three will do). Upstream issue #1181.
+- **Cursors surface a connection that dies between batches** (3.8.4). An async-iterated
+  `cursor()` whose connection closes while the caller holds a batch throws the error from
+  the next `next()`. Upstream ends the loop as if every row had been read. A `cursor(n, fn)`
+  whose callback outlives its connection no longer writes to the dead socket once the
+  callback returns, nor to the reopened one that now serves another query. Upstream
+  crashes the process there, with a TypeError outside any promise.

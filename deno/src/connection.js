@@ -139,7 +139,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       error(e)
       return
     }
-    x.on('error', error)
+    x.on('error', socketError)
     x.on('close', closed)
     x.on('drain', drain)
     return x
@@ -291,7 +291,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     socket.removeAllListeners()
     socket = tls.connect(options)
     socket.on('secureConnect', connected)
-    socket.on('error', error)
+    socket.on('error', socketError)
     socket.on('close', closed)
     socket.on('drain', drain)
   }
@@ -381,6 +381,14 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     }
   }
 
+  // A socket error that follows the server's own error is the server's error
+  // as far as the queries it fails are concerned: a FATAL such as 57P01 is
+  // often followed by a reset, because the Sync a cursor answers any error
+  // with reaches a backend that has already exited.
+  function socketError(err) {
+    error(errorResponse || err)
+  }
+
   function error(err) {
     if (connection.queue === queues.connecting && options.host[retries + 1])
       return
@@ -441,6 +449,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     remaining = 0
     incomings = null
     clearImmediate(nextWriteTimer)
+    chunk = nextWriteTimer = null
     socket.removeListener('data', data)
     socket.removeListener('connect', connected)
     idleTimer.cancel()
@@ -450,10 +459,30 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     socket.removeAllListeners()
     socket = null
 
+    // Whatever the socket still owed a reply fails with it, with the server's
+    // own error when one arrived: a FATAL such as 57P01 waits for a
+    // ReadyForQuery that never comes. That includes work sent since an 'error'
+    // event, and a multi-host connection still in `connecting`, which error()
+    // spares so that the next host can be tried - a query already sent can't be.
+    if (!initial && (query || sent.length)) {
+      const err = errorResponse || Errors.connection('CONNECTION_CLOSED', options, socket)
+      errored(err)
+      while (sent.length)
+        queryError(sent.shift(), err)
+    }
+
+    // The rest of the socket's state dies with it. Kept, the reopened socket's
+    // first ReadyForQuery hands the dead one's error, or its query, to the next
+    // query in line, and a half-read row stream offsets that query's rows. A
+    // socket that closes while starting up is simply reopened: all it owed was
+    // the startup's own internal queries.
+    query = results = errorResponse = null
+    result = new Result()
+    rows = 0
+
     if (initial)
       return reconnect()
 
-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
     closedTime = performance.now()
     hadError && options.shared.retries++
     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000

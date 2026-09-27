@@ -135,3 +135,11 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.3
   was written for a cancelled query no further `ReadyForQuery` arrives: the scope stalls
   forever with its remaining statements queued and its server-side transaction open. Any
   cursor inside the scope is enough to park queries there.
+- **A connection whose backend dies fails what it owed, then forgets it** (3.8.4). A
+  terminated backend (`pg_terminate_backend`, a restart, a failover) sends a FATAL such as
+  `57P01` and closes. The in-flight query now fails with that error, where upstream gave it
+  a generic `CONNECTION_CLOSED`, or `ECONNRESET` when the reset came first. Upstream also
+  kept the dead socket's query, error and row counter: the reopened connection handed the
+  stale `57P01` to the next query, which never ran, and a `sql.end()` waiting on the dead
+  query never settled. Work sent between the socket's `error` and `close` events is failed
+  too, where upstream left it waiting.

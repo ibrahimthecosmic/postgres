@@ -3352,6 +3352,55 @@ t('Ensure transactions throw if connection is closed dwhile there is no query', 
   return ['CONNECTION_CLOSED', x.code]
 })
 
+// Kill a backend from the suite's own connection. Pass the onclose promise of
+// the pool that used it to also wait until that pool has seen it close.
+async function terminate(pid, closed) {
+  await sql`select pg_terminate_backend(${ pid })`
+  await closed
+}
+
+async function running(pid) {
+  while (!(await sql`select 1 from pg_stat_activity where pid = ${ pid } and state = 'active'`).length)
+    await delay(10)
+}
+
+t('A terminated backend fails its own query with its error, not the next one', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  const [{ pid }] = await sql`select pg_backend_pid() as pid`
+  const query = sql`select pg_sleep(2)`.catch(e => e)
+  await running(pid)
+  await terminate(pid)
+
+  return ['57P01 1', (await query).code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
+t('End settles after a backend is terminated mid-query', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  const [{ pid }] = await sql`select pg_backend_pid() as pid`
+  const query = sql`select pg_sleep(2)`.catch(e => e)
+  await running(pid)
+  await terminate(pid)
+  await query
+
+  // Nothing else runs on the pool: the dead query must not be kept around
+  // for end() to wait on.
+  return [true, true, await sql.end()]
+})
+
+t('A backend terminated partway through its rows leaves the next result whole', async() => {
+  // No array types query, which would run first on the reopened connection
+  // and set the row counter straight by completing.
+  const sql = postgres({ ...options, fetch_types: false }) // eslint-disable-line
+  const [{ pid }] = await sql`select pg_backend_pid() as pid`
+  const query = sql`select x, pg_sleep(case when x = 3 then 2 else 0 end) from generate_series(1, 5) x`.catch(e => e)
+  await running(pid)
+  await terminate(pid)
+  await query
+  const result = await sql`select 1 as x`
+
+  return ['1 1', result.length + ' ' + (result[0] && result[0].x), await sql.end()]
+})
+
 t('Custom socket', {}, async() => {
   let result
   const sql = postgres({

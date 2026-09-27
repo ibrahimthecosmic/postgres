@@ -143,3 +143,8 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.3
   stale `57P01` to the next query, which never ran, and a `sql.end()` waiting on the dead
   query never settled. Work sent between the socket's `error` and `close` events is failed
   too, where upstream left it waiting.
+- The row counter restarts with every query (3.8.4). Upstream reset it only on
+  `CommandComplete`. A query that failed partway through its rows left the next query's
+  rows offset by that many, so its result started with holes: ``const [row] = await sql`…` ``
+  read `undefined`. This needs no connection fault, any error mid-stream is enough (a
+  division by zero in row three will do). Upstream issue #1181.

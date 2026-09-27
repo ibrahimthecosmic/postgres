@@ -3384,6 +3384,12 @@ t('End settles after a backend is terminated mid-query', async() => {
   return [true, true, await sql.end()]
 })
 
+t('A query that fails partway through its rows leaves the next result whole', async() => {
+  const error = await sql`select 1 / (3 - x) as x from generate_series(1, 5) x`.catch(e => e)
+  const result = await sql`select 1 as x`
+  return ['22012 1 1', error.code + ' ' + result.length + ' ' + (result[0] && result[0].x)]
+})
+
 t('A backend terminated partway through its rows leaves the next result whole', async() => {
   // No array types query, which would run first on the reopened connection
   // and set the row counter straight by completing.

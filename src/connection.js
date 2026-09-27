@@ -580,8 +580,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       errored(errorResponse)
     }
 
+    // rows too: only CommandComplete resets it, and a query that failed partway
+    // through its rows never gets one - the next query's rows would start
+    // where that one's stopped, leaving holes at the front of its result.
     query = results = errorResponse = null
     result = new Result()
+    rows = 0
     connectTimer.cancel()
 
     if (initial) {

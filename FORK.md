@@ -162,3 +162,10 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.3
   process (an uncaught TypeError in `nextWrite`). Once the pool had reopened the
   connection, it ran the handle's statements, and even its commit or rollback, in a
   different session. Releasing a dead reserved connection broke the pool for good.
+- **Subscriptions no longer print on stream loss** (3.8.4). Each replication stream, the
+  first and every reconnect's, reports its loss once to every subscriber's `onerror`, and
+  nothing goes to `console.error`. Upstream attached `onerror` to the first stream only,
+  so after a reconnect the application no longer heard of outages, while the library kept
+  logging "Unexpected error during logical streaming". A temporary-slot transaction handler
+  that rejects is reported to its own subscriber's `onerror`, where it used to get that
+  same log line.

@@ -2279,6 +2279,79 @@ t('subscribe survives walsender termination', { timeout: 10 }, async() => {
   ]
 })
 
+t('subscribe reports each stream loss to onerror and prints nothing', { timeout: 10 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const errors = []
+      , printed = []
+      , consoleError = console.error // eslint-disable-line
+  let onsubscribes = 0
+
+  console.error = (...xs) => printed.push(xs) // eslint-disable-line
+  try {
+    const { unsubscribe } = await sql.subscribe(
+      'transaction',
+      () => { /* noop */ },
+      () => onsubscribes++,
+      e => errors.push(e)
+    )
+
+    // Two outages: the second stream is a reconnect's, and has to report to
+    // onerror just like the first.
+    for (let i = 1; i <= 2; i++) {
+      await sql`select pg_terminate_backend(pid) from pg_stat_activity where backend_type = 'walsender'`
+      while (onsubscribes <= i)
+        await delay(20)
+    }
+    await unsubscribe()
+  } finally {
+    console.error = consoleError // eslint-disable-line
+  }
+
+  return [
+    '2 0',
+    errors.length + ' ' + printed.length,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
+t('subscribe reports a rejecting transaction handler to its onerror', { timeout: 5 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const errors = []
+  const { unsubscribe } = await sql.subscribe(
+    'transaction',
+    async() => { throw new Error('handler failed') },
+    () => { /* noop */ },
+    e => errors.push(e.message)
+  )
+
+  await sql`create table test (id serial primary key)`
+  await sql`insert into test default values`
+  await delay(200)
+  await unsubscribe()
+  return [
+    'handler failed',
+    errors.join(),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
+
 t('subscribe transaction', { timeout: 5 }, async() => {
   const sql = postgres({
     database: 'postgres_js_test',

@@ -128,7 +128,6 @@ export default function Subscribe(postgres, options) {
     return connection.then(x => {
       connected(x)
       onsubscribe(info())
-      stream && stream.on('error', onerror)
       return { unsubscribe, drop, state, sql, get slot() { return slot }, get position() { return position ? position() : null } }
     })
   }
@@ -246,8 +245,12 @@ export default function Subscribe(postgres, options) {
       stream.destroyed || stream.writableEnded || pong()
     }
 
+    // Every stream - the first and each reconnect's - reports its loss to the
+    // current subscribers' onerror, once each. Nothing is printed: reconnecting
+    // is automatic, and whether an outage is worth a log line is the
+    // application's call.
     function error(e) {
-      console.error('Unexpected error during logical streaming - reconnecting', e) // eslint-disable-line
+      subscribers.forEach(event => event.forEach(({ onerror }) => onerror(e)))
     }
 
     function data(x) {
@@ -360,7 +363,7 @@ export default function Subscribe(postgres, options) {
       // With a durable slot the returned promise is the ack signal: the slot
       // may only advance past this transaction once every handler has settled.
       // A handler that returns nothing cannot be waited for and acks at once.
-      fns.forEach(({ fn }) => {
+      fns.forEach(({ fn, onerror }) => {
         const it = Changes()
         t.iterators.push(it)
         try {
@@ -369,9 +372,9 @@ export default function Subscribe(postgres, options) {
             return
           durable
             ? (t.waiting++, x.then(() => settled(false), e => settled(true, e)))
-            : x.catch(error)
+            : x.catch(onerror)
         } catch (e) {
-          durable ? failed(e) : error(e)
+          durable ? failed(e) : onerror(e)
         }
       })
 

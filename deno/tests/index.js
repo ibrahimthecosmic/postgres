@@ -3041,6 +3041,7 @@ t('subscribe durable slot recreates an invalidated slot', { timeout: 30 }, async
 
   const infos = []
       , seen = []
+      , errors = []
 
   const listen = x => x.subscribe(
     'transaction',
@@ -3052,7 +3053,8 @@ t('subscribe durable slot recreates an invalidated slot', { timeout: 30 }, async
         // connection loss rejects live iterators — expected here
       }
     },
-    info => infos.push(info.resumed)
+    info => infos.push(info.resumed),
+    e => errors.push(e.code)
   )
 
   const first = subscriber()
@@ -3080,6 +3082,7 @@ t('subscribe durable slot recreates an invalidated slot', { timeout: 30 }, async
   }
   const [{ wal_status: before }] = await sql`select wal_status from pg_replication_slots where slot_name = ${ slot }`
 
+  errors.length = 0
   const second = subscriber()
   const b = await listen(second)
   await sql`insert into test (name) values ('b')`
@@ -3090,11 +3093,26 @@ t('subscribe durable slot recreates an invalidated slot', { timeout: 30 }, async
   await second.end()
 
   return [
-    'lost a,b false,false reserved',
-    before + ' ' + seen.join(',') + ' ' + infos.join(',') + ' ' + after,
+    'lost a,b false,false reserved SLOT_INVALIDATED',
+    before + ' ' + seen.join(',') + ' ' + infos.join(',') + ' ' + after + ' ' + errors.join(','),
     await sql`drop table test`,
     await sql`drop publication alltables`,
     await sql.end()
+  ]
+})
+
+t('Arrays with a non-default lower bound decode without their bounds', async() => {
+  const [x] = await sql`
+    select '[0:1]={7,8}'::int[] as a,
+           '[5:5]={9}'::int8[] as b,
+           '[-1:0]={x,y}'::text[] as c,
+           '[1:2][3:4]={{1,2},{3,4}}'::int[] as d,
+           array['0:1]=', '{']::text[] as e,
+           '{{1,2},{3,4}}'::int[] as f
+  `
+  return [
+    '[7,8] ["9"] ["x","y"] [[1,2],[3,4]] ["0:1]=","{"] [[1,2],[3,4]]',
+    [x.a, x.b, x.c, x.d, x.e, x.f].map(v => JSON.stringify(v)).join(' ')
   ]
 })
 
@@ -3465,6 +3483,17 @@ t('Ensure transactions throw if connection is closed dwhile there is no query', 
   return ['CONNECTION_CLOSED', x.code]
 })
 
+t('An idle transaction\'s FATAL rejects its next query, not CONNECTION_CLOSED', async() => {
+  const sql = postgres({ ...options, max: 2 }) // eslint-disable-line
+  const x = await sql.begin(async sql => {
+    await sql`set local idle_in_transaction_session_timeout = '100ms'`
+    await delay(400)
+    return sql`select 1`
+  }).catch(e => e)
+  const [{ y }] = await sql`select 2 as y`
+  return ['25P03 2', x.code + ' ' + y, await sql.end()]
+})
+
 // Kill a backend from the suite's own connection. Pass the onclose promise of
 // the pool that used it to also wait until that pool has seen it close.
 async function terminate(pid, closed) {
@@ -3567,7 +3596,9 @@ t('A reserved connection that closed fails its queries, and releasing it keeps t
   const error = await reserved`select 1`.catch(e => e)
   reserved.release()
 
-  return ['CONNECTION_CLOSED 1', error.code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+  // The server's FATAL arrived while the connection was idle: it, not a bare
+  // CONNECTION_CLOSED, is why the query failed.
+  return ['57P01 1', error.code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
 })
 
 t('Custom socket', {}, async() => {

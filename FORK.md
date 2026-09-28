@@ -51,7 +51,7 @@ The package name stays `postgres`, so imports don't change. Generated `cjs/`, `d
 `cf/` outputs are committed, and `prepare` rebuilds them, so git installs work directly:
 
 ```sh
-pnpm add 'postgres@github:<owner>/postgres#v3.8.4'
+pnpm add 'postgres@github:<owner>/postgres#v3.8.5'
 ```
 
 Upgrading an app = bump the tag in `package.json`, `pnpm install`. For a private repo, CI
@@ -61,7 +61,7 @@ Alternative for many projects / cleaner CI: publish as a scoped package and alia
 imports still resolve to `postgres`:
 
 ```sh
-pnpm add postgres@npm:@<owner>/postgres@3.8.4
+pnpm add postgres@npm:@<owner>/postgres@3.8.5
 ```
 
 ## Fork-specific behavior differences from upstream
@@ -169,3 +169,19 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.4
   logging "Unexpected error during logical streaming". A temporary-slot transaction handler
   that rejects is reported to its own subscriber's `onerror`, where it used to get that
   same log line.
+- **A FATAL that arrives while a connection is idle is its close's reason** (3.8.5). The
+  server ends an idle session with a FATAL of its own: `25P03` for
+  `idle_in_transaction_session_timeout`, `57P05` for `idle_session_timeout`, `57P01` for a
+  terminate. Nothing was in flight to receive it, so upstream dropped it, and the
+  transaction or reserved handle whose connection it was failed with a bare
+  `CONNECTION_CLOSED`. The error is now kept: it is what the close reports to a
+  `sql.begin` / `sql.reserve` scope, and what the connection's next query is rejected with.
+  It is forgotten when the connection reopens.
+- **An invalidated durable slot is reported to `onerror`, not printed** (3.8.5). Recreating
+  a slot the server invalidated (`wal_status = 'lost'`) wrote a line to `console.error`.
+  Each subscriber's `onerror` now receives an error with code `SLOT_INVALIDATED` before the
+  slot is recreated, and `onsubscribe`'s `resumed: false` follows as before.
+- **Arrays with a non-default lower bound decode** (3.8.5). Postgres prefixes such a
+  value with its dimensions (`[0:1]={7,8}`), which upstream parsed as one more level of
+  nesting (`[[7,8]]`). The prefix is dropped with its bounds, as `to_jsonb` drops them, and
+  the value decodes as `[7,8]`. Multi-dimensional values keep decoding as nested arrays.

@@ -105,6 +105,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     , ended = null
     , nonce = null
     , query = null
+    , idleFatal = null
     , final = null
 
   const connection = {
@@ -160,7 +161,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     // Only a caller holding on to a connection that has since closed gets
     // here; queued, the query would be answered by whatever reopens it.
     if (!socket)
-      return queryError(q, Errors.connection('CONNECTION_CLOSED', options))
+      return queryError(q, idleFatal || Errors.connection('CONNECTION_CLOSED', options))
 
     if (stream)
       return queryError(q, Errors.generic('COPY_IN_PROGRESS', 'You cannot execute queries during copy'))
@@ -346,6 +347,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
 
   async function connect() {
     terminated = false
+    idleFatal = null
     backendParameters = {}
     socket || (socket = await createSocket())
 
@@ -495,7 +497,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     closedTime = performance.now()
     hadError && options.shared.retries++
     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-    onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
+    onclose(connection, idleFatal || Errors.connection('CONNECTION_CLOSED', options, socket))
     // An end() awaited while this connection was still connecting (or busy)
     // is only ever settled by terminate(); a socket that dies with nothing
     // left to do must settle it too, or sql.end() hangs forever.
@@ -870,7 +872,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       (query.cursorFn || query.describeFirst) && write(Sync)
       errorResponse = Errors.postgres(parseError(x))
     } else {
-      errored(Errors.postgres(parseError(x)))
+      // Nothing in flight: a FATAL the server sends an idle session
+      // (idle_in_transaction_session_timeout's 25P03, idle_session_timeout's
+      // 57P05, an administrator's terminate) is the reason the socket is about
+      // to close. Kept, it is what the close reports (a transaction or a
+      // reserved connection, which cannot reopen, fails with it) and what the
+      // next query on this connection is rejected with, instead of a bare
+      // CONNECTION_CLOSED.
+      const err = Errors.postgres(parseError(x))
+      if (err.severity === 'FATAL' || err.severity === 'PANIC')
+        idleFatal = err
+      errored(err)
     }
   }
 

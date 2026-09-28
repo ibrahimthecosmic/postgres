@@ -273,9 +273,17 @@ const arrayParserState = {
   last: 0
 }
 
+// An array whose lower bound is not 1 carries its dimensions before the
+// value: '[0:1]={7,8}', '[1:1][-2:-1]={{1,2}}'. The caller strips the first
+// character, so the decoration arrives as '0:1]={7,8}'. An ordinary array's
+// text never matches: its elements quote a '{', and this needs one unquoted
+// right after the '='. The bounds are dropped, as to_jsonb drops them.
+const dimensions = /^-?\d+:-?\d+\](?:\[-?\d+:-?\d+\])*=\{/
+
 const arrayParser = module.exports.arrayParser = function arrayParser(x, parser, typarray) {
   arrayParserState.i = arrayParserState.last = 0
-  return arrayParserLoop(arrayParserState, x, parser, typarray)
+  const decorated = x.charCodeAt(0) !== 123 && dimensions.exec(x)
+  return arrayParserLoop(arrayParserState, decorated ? x.slice(decorated[0].length) : x, parser, typarray)
 }
 
 function arrayParserLoop(s, x, parser, typarray) {

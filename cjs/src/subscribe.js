@@ -1,3 +1,5 @@
+const { Errors } = require('./errors.js')
+
 const noop = () => { /* noop */ }
 
 module.exports = Subscribe;function Subscribe(postgres, options) {
@@ -577,7 +579,10 @@ module.exports = Subscribe;function Subscribe(postgres, options) {
     let xs = await slotState(sql, slot)
 
     if (xs[0].wal_status === 'lost') {
-      console.error('Replication slot ' + slot + ' was invalidated - recreating it, retained changes are lost') // eslint-disable-line
+      // Reported like a stream loss, to the subscribers' onerror - nothing is
+      // printed. onsubscribe's resumed: false follows once the new slot streams.
+      const error = Errors.generic('SLOT_INVALIDATED', 'replication slot ' + slot + ' was invalidated - recreating it, retained changes are lost')
+      subscribers.forEach(event => event.forEach(({ onerror }) => onerror(error)))
       await sql.unsafe(`DROP_REPLICATION_SLOT ${ slot } WAIT`)
       created = await createSlot(sql, slot)
       xs = await slotState(sql, slot)

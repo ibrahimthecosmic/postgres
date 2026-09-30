@@ -77,6 +77,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       , connectTimer = timer(connectTimedOut, options.connect_timeout)
 
   let socket = null
+    , refed = true
     , cancelMessage
     , errorResponse = null
     , result = new Result()
@@ -119,6 +120,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     execute,
     cancel,
     end,
+    ref,
+    release,
     count: 0,
     id
   }
@@ -141,6 +144,27 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     x.on('close', closed)
     x.on('drain', drain)
     return x
+  }
+
+  // Whether this connection's socket holds the process open (see move() in
+  // index.js). A socket opened later starts ref'd, like the connection that
+  // opens it for a query.
+  function ref(x) {
+    if (refed === x)
+      return
+    refed = x
+    socket && (x ? socket.ref && socket.ref() : socket.unref && socket.unref())
+  }
+
+  // A reserve() handed this connection back. It rejoins the pool - or, when
+  // end() was called while it was reserved, it closes: that end() waits on
+  // it, and nothing else would ever settle it. With a query still in
+  // flight, its ReadyForQuery does the same.
+  function release() {
+    connection.reserved = null
+    if (!ending)
+      return onopen(connection)
+    query || sent.length || onending(connection) || terminate()
   }
 
   async function cancel({ pid, secret }, resolve, reject) {
@@ -469,6 +493,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
 
     socket.removeAllListeners()
     socket = null
+    refed = true
 
     // Whatever the socket still owed a reply fails with it, with the server's
     // own error when one arrived: a FATAL such as 57P01 waits for a
@@ -1141,6 +1166,9 @@ function timer(fn, seconds) {
     start() {
       timer && clearTimeout(timer)
       timer = setTimeout(done, seconds * 1000, arguments)
+      // Idle and lifetime timers only close a connection: they never hold
+      // the process open themselves.
+      timer && timer.unref && timer.unref()
     }
   }
 

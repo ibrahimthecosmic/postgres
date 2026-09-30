@@ -63,7 +63,7 @@ function Postgres(a, b) {
       , full = Queue()
       , queues = { connecting, reserved, closed, ended, open, busy, full }
 
-  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose }))
+  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onending }))
 
   const sql = Sql(handler)
 
@@ -373,7 +373,11 @@ function Postgres(a, b) {
     if (closed.length)
       return connect(closed.shift(), query)
 
-    busy.length
+    // A cancellable query is never written behind another one: pipelined, it
+    // is on the wire but not active, and cancel() could only mark it - the
+    // CancelRequest would go out once the statement ahead of it finished.
+    // Queued in the pool it is simply dequeued.
+    busy.length && !query.options.cancellable
       ? go(busy.shift(), query)
       : queries.push(query)
   }
@@ -442,12 +446,17 @@ function Postgres(a, b) {
     let max = Math.ceil(queries.length / (connecting.length + 1))
       , ready = true
 
+    let sent = false
     while (ready && queries.length && max-- > 0) {
+      if (sent && queries.peek().options && queries.peek().options.cancellable)
+        break
+
       const query = queries.shift()
       if (query.reserve)
         return query.reserve(c)
 
       ready = c.execute(query)
+      sent = true
     }
 
     ready
@@ -455,12 +464,37 @@ function Postgres(a, b) {
       : move(c, full)
   }
 
+  // A connection that is ending finished its own work. What still waits in
+  // the pool queue was asked for before end(), so it is served here rather
+  // than by a reconnect: a connection reopened for it no longer knows it is
+  // ending, and parks in `open` after the query - the socket stays and the
+  // process never exits. A reserve() still waiting is refused, since the
+  // connection it would hold is closing. False when nothing is left.
+  function onending(c) {
+    while (queries.length && queries.peek().reserve)
+      queries.shift().reject(Errors.connection('CONNECTION_ENDED', options, options))
+
+    if (!queries.length)
+      return false
+
+    let ready = c.execute(queries.shift())
+    while (ready && queries.length && !queries.peek().reserve && !queries.peek().options.cancellable)
+      ready = c.execute(queries.shift())
+    return true
+  }
+
   function onclose(c, e) {
     move(c, closed)
     c.reserved = null
     c.onclose && (c.onclose(e), c.onclose = null)
     options.onclose && options.onclose(c.id)
-    queries.length && connect(c, queries.shift())
+    if (!queries.length)
+      return
+
+    connect(c, queries.shift())
+    // Reopened while the pool ends (its socket died with work queued): it
+    // serves that work, then ends like the rest.
+    ending && c.end()
   }
 }
 

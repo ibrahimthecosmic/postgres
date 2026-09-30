@@ -697,6 +697,9 @@ declare namespace postgres {
 
   interface PendingQueryModifiers<TRow extends readonly any[]> {
     simple(): this;
+    /** Never pipeline this query behind a busy connection's statement: it
+     * waits in the pool queue instead, where `cancel()` dequeues it. */
+    cancellable(): this;
     readable(): Promise<Readable>;
     writable(): Promise<Writable>;
 

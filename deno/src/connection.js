@@ -176,7 +176,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       q.state = backend
       query
         ? sent.push(q)
-        : (query = q, query.active = true)
+        : (query = q, start(query))
 
       build(q)
       return write(toBuffer(q))
@@ -631,7 +631,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         return
     }
 
-    while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
+    while (sent.length && (query = sent.shift()) && (start(query), query.cancelled))
       Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
 
     if (query)
@@ -893,6 +893,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   // that second run fails, the error to report is the one it hit — not the
   // stale-plan error that caused the retry, which is an internal detail the
   // caller did not cause. The trigger stays reachable as `cause`.
+  // The query is now the one this connection's backend works on: written
+  // straight to an idle connection, or next in line once the statement it was
+  // pipelined behind completed. startedAt marks that moment, so a caller can
+  // tell the time a statement spent on the server from the time it waited for
+  // a connection or behind another statement. A retry keeps the first mark.
+  function start(q) {
+    q.active = true
+    q.startedAt || (q.startedAt = performance.now())
+  }
+
   function retry(q, error) {
     delete statements[q.signature]
     q.retried = error

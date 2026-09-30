@@ -3299,6 +3299,55 @@ t('A cancellable query waits off a busy pipeline and cancels at once', async() =
   return ['57014 true 1', error.code + ' ' + (took < 250) + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
 })
 
+t('A pipelined query starts when the one ahead of it completes', async() => {
+  const sql = postgres({ ...options, max: 1 }) // eslint-disable-line
+  await sql`select 1`
+  const hold = sql`select pg_sleep(0.2)`.execute()
+  await new Promise(r => setImmediate(r))
+  // Written to the socket at once, behind the sleep: it is not running yet.
+  const query = sql`select 1 as x`.execute()
+  await new Promise(r => setImmediate(r))
+  const before = query.startedAt
+  await hold
+  await query
+
+  return ['0 true', before + ' ' + (query.startedAt - hold.startedAt >= 190), await sql.end()]
+})
+
+t('A query waiting for a connection starts when it gets one', async() => {
+  const sql = postgres({ ...options, max: 1 }) // eslint-disable-line
+  await sql`select 1`
+  const hold = sql`select pg_sleep(0.2)`.execute()
+  await new Promise(r => setImmediate(r))
+  const query = sql`select 1 as x`.cancellable().execute()
+  await query
+
+  return [true, query.startedAt - hold.startedAt >= 190, await sql.end()]
+})
+
+t('Stats count the pool\'s connections and the queries waiting for one', async() => {
+  const sql = postgres({ ...options, max: 2 }) // eslint-disable-line
+  const empty = sql.stats()
+  await Promise.all([sql`select 1`, sql`select 1`])
+  const one = sql.stats()
+  const reserved = await sql.reserve()
+  const hold = sql`select pg_sleep(0.1)`.execute()
+  await new Promise(r => setImmediate(r))
+  const waiter = sql`select 1`.cancellable().execute()
+  await new Promise(r => setImmediate(r))
+  const full = sql.stats()
+  reserved.release()
+  await Promise.all([hold, waiter])
+  const idle = sql.stats()
+  const f = x => [x.max, x.open, x.busy, x.idle, x.waiting].join()
+
+  return [
+    '2,0,0,0,0 2,2,0,2,0 2,2,2,0,1 2,2,0,2,0',
+    [empty, one, full, idle].map(f).join(' '),
+    await sql.end()
+  ]
+})
+
 t('End with more queries than connections closes every connection', async() => {
   const application_name = 'end_' + crypto.randomBytes(4).toString('hex')
   const pool = postgres({ ...options, max: 2, connection: { application_name } })

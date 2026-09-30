@@ -185,3 +185,13 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   value with its dimensions (`[0:1]={7,8}`), which upstream parsed as one more level of
   nesting (`[[7,8]]`). The prefix is dropped with its bounds, as `to_jsonb` drops them, and
   the value decodes as `[7,8]`. Multi-dimensional values keep decoding as nested arrays.
+- **`query.startedAt` and `sql.stats()`** (3.8.7). Each query records `startedAt`
+  (`performance.now()`) when it becomes the query its connection's backend works on: written
+  to an idle connection, or, pipelined behind another statement, once that statement
+  completes. `0` until then. The time from dispatch to `startedAt` is the wait for a
+  connection or behind another statement; from `startedAt` to settle is the statement's own.
+  `sql.stats()` returns `{ max, open, busy, idle, waiting }` from the pool's queues: its
+  size, connections open or opening, those serving a query, transaction or `reserve()`,
+  those idle, and the queries (and `reserve()` calls) dispatched with no connection yet.
+  Upstream has neither, so a client timing a query from dispatch counts a saturated pool's
+  queue as query time.

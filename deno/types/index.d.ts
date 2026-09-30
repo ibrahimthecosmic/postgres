@@ -704,6 +704,10 @@ declare namespace postgres {
     writable(): Promise<Writable>;
 
     execute(): this;
+    /** `performance.now()` when the query became the one its connection's
+     * backend works on — written to an idle connection, or next in line once
+     * the statement it was pipelined behind completed; 0 until then. */
+    readonly startedAt: number;
     /** Resolves when the CancelRequest has been handled, rejects when the
      * connection it needs cannot be opened; `undefined` once cancelled. */
     cancel(): Promise<void> | void;
@@ -819,6 +823,22 @@ declare namespace postgres {
     begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
 
     reserve(): Promise<ReservedSql<TTypes>>
+
+    /** A snapshot of the pool's connections and of the queries waiting for one. */
+    stats(): PoolStats;
+  }
+
+  interface PoolStats {
+    /** The pool's size (`max`). */
+    max: number;
+    /** Connections open or opening. */
+    open: number;
+    /** Open connections serving a query, a transaction or a `reserve()`. */
+    busy: number;
+    /** Open connections with nothing to do. */
+    idle: number;
+    /** Queries (and `reserve()` calls) dispatched with no connection yet. */
+    waiting: number;
   }
 
   interface TransactionSql<TTypes extends Record<string, unknown> = {}> extends ISql<TTypes>  {

@@ -79,7 +79,8 @@ function Postgres(a, b) {
     listen,
     begin,
     close,
-    end
+    end,
+    stats
   })
 
   return sql
@@ -401,6 +402,22 @@ function Postgres(a, b) {
           resolve()
         )
     })
+  }
+
+  // A snapshot of the pool: its size, the connections open or opening, those
+  // serving a query, a transaction or a reserve(), those idle, and the queries
+  // (and reserve() calls) waiting for a connection. A query pipelined onto a
+  // busy connection is not waiting here: it has its connection.
+  function stats() {
+    const idle = open.length
+        , opened = connections.length - closed.length - ended.length
+    return {
+      max: options.max,
+      open: opened,
+      busy: opened - idle - connecting.length,
+      idle,
+      waiting: queries.length
+    }
   }
 
   async function end({ timeout = null } = {}) {

@@ -29,6 +29,7 @@ const Query = module.exports.Query = class Query extends Promise {
     this.active = false
     this.cancelled = null
     this.executed = false
+    this.startedAt = 0
     this.signature = ''
 
     this[originError] = this.handler.debug

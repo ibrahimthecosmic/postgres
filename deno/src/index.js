@@ -155,6 +155,7 @@ function Postgres(a, b) {
       idle_timeout: null,
       max_lifetime: null,
       fetch_types: false,
+      ref_idle: true,
       onclose() {
         Object.entries(listen.channels).forEach(([name, { listeners }]) => {
           delete listen.channels[name]
@@ -220,11 +221,16 @@ function Postgres(a, b) {
 
     const sql = Sql(handler)
     sql.release = () => {
-      // A closed connection went back to the pool when it closed.
+      // A closed connection went back to the pool when it closed, and a
+      // released one already went back.
       if (lost)
         return
-      c.reserved = null
-      onopen(c)
+      // From here on the connection is someone else's: nothing sent through
+      // this handle may reach it, or a late statement (a second rollback, a
+      // commit) runs inside whatever session holds the connection by then.
+      lost = fail(queue, Errors.generic('RESERVATION_RELEASED', 'this reserved connection was released; reserve() another'))
+      c.onclose = null
+      c.release()
     }
 
     return sql
@@ -244,16 +250,22 @@ function Postgres(a, b) {
     let savepoints = 0
       , connection
       , lost = null
+      , done = null
+      , onclose = null
       , prepare = null
 
     try {
       await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
       return await Promise.race([
         scope(connection, fn),
-        new Promise((_, reject) => connection.onclose = e => reject(lost = fail(queries, e)))
+        new Promise((_, reject) => connection.onclose = onclose = e => reject(lost = fail(queries, e)))
       ])
-    } catch (error) {
-      throw error
+    } finally {
+      // The transaction is over and its connection back in the pool: a scope
+      // that escaped the callback must not send anything more through it. The
+      // connection may already serve another reserve(), whose onclose stays.
+      done = fail(queries, Errors.generic('TRANSACTION_ENDED', 'this transaction already ended; begin() another'))
+      connection && connection.onclose === onclose && (connection.onclose = null)
     }
 
     async function scope(c, fn, name) {
@@ -299,8 +311,8 @@ function Postgres(a, b) {
 
       function handler(q) {
         q.catch(e => uncaughtError || (uncaughtError = e))
-        lost
-          ? q.reject(lost)
+        lost || done
+          ? q.reject(lost || done)
           : c.queue === full
             ? queries.push(q)
             : c.execute(q) || move(c, full)
@@ -343,13 +355,19 @@ function Postgres(a, b) {
     return false
   }
 
+  // An idle connection does not keep the process alive (its socket is
+  // unref'd while it sits in `open`), so a script that never calls end()
+  // still exits; anything that uses it refs it again. A LISTEN connection
+  // idles by design and stays ref'd, and so does every connection once the
+  // pool is ending: end() resolves on the sockets' close, which an unref'd
+  // socket would let the process exit before.
   function move(c, queue) {
     c.queue.remove(c)
     queue.push(c)
     c.queue = queue
     queue === open
-      ? c.idleTimer.start()
-      : c.idleTimer.cancel()
+      ? (c.idleTimer.start(), options.ref_idle || ending || c.ref(false))
+      : (c.idleTimer.cancel(), c.ref(true))
     return c
   }
 
@@ -426,6 +444,7 @@ function Postgres(a, b) {
 
     await 1
     let timer
+    connections.forEach(c => c.ref(true))
     return ending = Promise.race([
       new Promise(r => timeout !== null && (timer = setTimeout(destroy, timeout * 1000, r))),
       Promise.all(connections.map(c => c.end()).concat(

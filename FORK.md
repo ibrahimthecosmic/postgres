@@ -195,3 +195,22 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   those idle, and the queries (and `reserve()` calls) dispatched with no connection yet.
   Upstream has neither, so a client timing a query from dispatch counts a saturated pool's
   queue as query time.
+- **A released `reserve()` and an ended `begin` scope refuse every later query** (3.8.8).
+  Upstream kept executing through them on the connection they had held, after it went
+  back to the pool: a second `rollback` sent through a released reservation ran inside
+  whichever transaction held the connection next, and rolled it back; a scope that escaped
+  its `sql.begin` callback did the same. A query through a released reservation now rejects
+  with code `RESERVATION_RELEASED` (queries it had parked are rejected at `release()`), one
+  through a scope whose transaction ended with `TRANSACTION_ENDED`, and neither touches the
+  connection. A second `release()` is a no-op.
+- **An idle pool does not keep the process alive** (3.8.8). A connection's socket is
+  unref'd while it sits idle in the pool and ref'd again the moment work is queued on it,
+  and the idle and lifetime timers are unref'd, so a script that never calls `sql.end()`
+  exits when its work is done. Upstream's idle sockets held the event loop forever
+  (`idle_timeout` defaults to none). A LISTEN connection stays ref'd, as does every
+  connection once `end()` has begun, since `end()` settles on the sockets' close. The Deno
+  build's socket polyfill has no ref/unref and is unchanged.
+- **`end()` settles when a reservation is released after it began** (3.8.8). A `reserve()`d
+  connection has its `end()` deferred until it is released; upstream's `release()` then
+  put it back in the pool as an idle connection, and nothing ever settled that `end()`.
+  It now closes, like any other connection of an ending pool.

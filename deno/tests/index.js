@@ -3923,4 +3923,141 @@ t('query during copy error', async() => {
   ]
 })
 
+t('A released reservation refuses every later query and never reaches the connection again', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  await sql`create table if not exists stale_reserve (x text)`
+  const stale = await sql.reserve()
+  await stale`select 1`
+  stale.release()
+
+  // max: 1, so the next reservation is the same connection, in its own
+  // transaction; the stale handle's rollback must not end it.
+  const next = await sql.reserve()
+  await next`begin`
+  await next`insert into stale_reserve values ('kept')`
+  const error = await stale`rollback`.catch(e => e)
+  await next`commit`
+  next.release()
+  const stale2 = await stale`select 1`.catch(e => e.code)
+  stale.release() // a second release is a no-op
+
+  const [{ count }] = await sql`select count(*)::int from stale_reserve where x = 'kept'`
+  await sql`drop table stale_reserve`
+  return ['RESERVATION_RELEASED RESERVATION_RELEASED 1', error.code + ' ' + stale2 + ' ' + count, await sql.end()]
+})
+
+t('A transaction scope that escaped its callback refuses every later query', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  await sql`create table if not exists stale_begin (x text)`
+  let escaped
+  await sql.begin(async sql => {
+    escaped = sql
+    await sql`select 1`
+  })
+
+  const other = await sql.reserve()
+  await other`begin`
+  await other`insert into stale_begin values ('kept')`
+  const error = await escaped`rollback`.catch(e => e)
+  await other`commit`
+  other.release()
+
+  const [{ count }] = await sql`select count(*)::int from stale_begin where x = 'kept'`
+  await sql`drop table stale_begin`
+  return ['TRANSACTION_ENDED 1', error.code + ' ' + count, await sql.end()]
+})
+
+t('A failed transaction scope refuses later queries too', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  let escaped
+  await sql.begin(async sql => {
+    escaped = sql
+    throw new Error('boom')
+  }).catch(() => null)
+  const error = await escaped`select 1`.catch(e => e)
+  return ['TRANSACTION_ENDED 1', error.code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
+t('A script whose pool sits idle exits without end()', { timeout: 20 }, async() => {
+  // Only the Node socket can be unref'd; the Deno build's polyfill cannot.
+  if (globalThis.Deno)
+    return [1, 1]
+
+  const { spawn } = await import('child_process')
+  const source = String(rel('../src/index.js'))
+  const script = `
+    const { default: postgres } = await import(${ JSON.stringify(source) })
+    const sql = postgres(${ JSON.stringify({ ...options, idle_timeout: null, max: 2 }) })
+    const [{ x }] = await sql\`select 1 as x\`
+    const reserved = await sql.reserve()
+    await reserved\`select 1\`
+    reserved.release()
+    await sql.begin(sql => sql\`select 1\`)
+    console.log(x)
+  `
+  const started = Date.now()
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'inherit'] })
+  let out = ''
+  child.stdout.on('data', x => out += x)
+  const code = await new Promise(r => {
+    const timer = setTimeout(() => child.kill(), 10000)
+    child.on('exit', code => (clearTimeout(timer), r(code)))
+  })
+  return ['0 1 fast', code + ' ' + out.trim() + ' ' + (Date.now() - started < 8000 ? 'fast' : 'slow')]
+})
+
+t('end() still resolves for a connection that goes idle while the pool ends', { timeout: 20 }, async() => {
+  if (globalThis.Deno)
+    return [1, 1]
+
+  const { spawn } = await import('child_process')
+  const source = String(rel('../src/index.js'))
+  const script = `
+    const { default: postgres } = await import(${ JSON.stringify(source) })
+    const sql = postgres(${ JSON.stringify({ ...options, idle_timeout: null, max: 2 }) })
+    await sql\`select 1\`
+    const reserved = await sql.reserve()
+    await reserved\`begin\`
+    const ended = sql.end()
+    await new Promise(r => setTimeout(r, 200))
+    await reserved\`rollback\`
+    reserved.release()
+    await ended
+    console.log('ended')
+  `
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'inherit'] })
+  let out = ''
+  child.stdout.on('data', x => out += x)
+  const code = await new Promise(r => {
+    const timer = setTimeout(() => child.kill(), 10000)
+    child.on('exit', code => (clearTimeout(timer), r(code)))
+  })
+  return ['0 ended', code + ' ' + out.trim()]
+})
+
+t('A LISTEN connection keeps the process alive', { timeout: 20 }, async() => {
+  if (globalThis.Deno)
+    return [1, 1]
+
+  const { spawn } = await import('child_process')
+  const source = String(rel('../src/index.js'))
+  const script = `
+    const { default: postgres } = await import(${ JSON.stringify(source) })
+    const sql = postgres(${ JSON.stringify({ ...options, idle_timeout: null }) })
+    await sql.listen('stay_alive', () => (console.log('notified'), sql.end()))
+    console.log('listening')
+  `
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'inherit'] })
+  let out = ''
+  const listening = new Promise(r => child.stdout.on('data', x => (out += x, out.includes('listening') && r())))
+  const exited = new Promise(r => child.on('exit', r))
+  await listening
+  await delay(500)
+  await sql`select pg_notify('stay_alive', 'x')`
+  const timer = setTimeout(() => child.kill(), 10000)
+  const code = await exited
+  clearTimeout(timer)
+  return ['0 listening notified', code + ' ' + out.trim().split('\n').join(' ')]
+})
+
 ;globalThis.addEventListener("unload", () => Deno.exit(process.exitCode))

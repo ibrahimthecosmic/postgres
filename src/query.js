@@ -61,6 +61,13 @@ export class Query extends Promise {
     return cancelling
   }
 
+  // Keep this query off a busy connection's pipeline, so that cancel()
+  // dequeues it for as long as it has not started (see handler in index.js).
+  cancellable() {
+    this.options.cancellable = true
+    return this
+  }
+
   simple() {
     this.options.simple = true
     this.options.prepare = false

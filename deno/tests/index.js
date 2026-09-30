@@ -3284,6 +3284,51 @@ t('Cancel while queued behind a cursor in a reserved connection', async() => {
   return [2, x, await sql.end()]
 })
 
+t('A cancellable query waits off a busy pipeline and cancels at once', async() => {
+  const sql = postgres({ ...options, max: 1 }) // eslint-disable-line
+  await sql`select 1`
+  const hold = sql`select pg_sleep(0.5)`.execute()
+  await new Promise(r => setImmediate(r))
+  // Pipelined behind the sleep, the cancel would only mark it: the fast
+  // select would run once the sleep ended, and resolve.
+  const query = sql`select 1 as x`.cancellable().execute()
+  await new Promise(r => setImmediate(r))
+  const start = Date.now()
+  await query.cancel()
+  const error = await query.catch(x => x)
+  const took = Date.now() - start
+  await hold
+
+  return ['57014 true 1', error.code + ' ' + (took < 250) + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
+t('End with more queries than connections closes every connection', async() => {
+  const application_name = 'end_' + crypto.randomBytes(4).toString('hex')
+  const pool = postgres({ ...options, max: 2, connection: { application_name } })
+  // Three queries on two connections: the third waits in the pool queue.
+  // An ending connection used to reconnect for it and then park open.
+  const xs = [1, 2, 3].map(x => pool`select ${ x }::int as x`.execute())
+  await pool.end()
+  const got = (await Promise.all(xs)).map(([{ x }]) => x).join()
+  await delay(100)
+  const [{ n }] = await sql`select count(*)::int as n from pg_stat_activity where application_name = ${ application_name }`
+
+  return ['1,2,3 0', got + ' ' + n]
+})
+
+t('End refuses a reserve still waiting for a connection', async() => {
+  const sql = postgres({ ...options, max: 1 }) // eslint-disable-line
+  const busy = sql`select pg_sleep(0.1)`.execute()
+  await new Promise(r => setImmediate(r))
+  const queued = sql`select 1 as x`.execute()
+  const reserved = sql.reserve().then(() => 'reserved', e => e.code)
+  await sql.end()
+
+  await busy
+
+  return ['1 CONNECTION_ENDED', (await queued)[0].x + ' ' + await reserved]
+})
+
 t('Fragments', async() => [
   1,
   (await sql`

@@ -49,7 +49,7 @@ const errorFields = {
   82  : 'routine'            // R
 }
 
-function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop } = {}) {
+function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onending = () => false } = {}) {
   const {
     sslnegotiation,
     ssl,
@@ -641,7 +641,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
           : (connection.reserved = null, onopen(connection))
         : connection.reserved()
       : ending
-        ? terminate()
+        ? onending(connection) || terminate()
         : onopen(connection)
   }
 

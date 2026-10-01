@@ -550,7 +550,10 @@ function parseOptions(a, b) {
   'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
   query.sslrootcert === 'system' && (query.ssl = 'verify-full')
 
-  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'subscribe_high_water_mark', 'subscribe_timeout', 'cancel_timeout']
+  const ints = [
+    'max', 'idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive',
+    'subscribe_high_water_mark', 'subscribe_timeout', 'cancel_timeout'
+  ]
   const defaults = {
     max             : globalThis.Cloudflare ? 3 : 10,
     ssl             : false,

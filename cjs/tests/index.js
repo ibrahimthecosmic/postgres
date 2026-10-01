@@ -374,6 +374,30 @@ t('Options from uri with special characters in user and pass', async() => {
   return [[opt.user, opt.pass].toString(), 'öla,pass^word']
 })
 
+t('max from the url is a number, and the pool opens that many connections', async() => {
+  const env = process.env // eslint-disable-line
+  const sql = postgres('postgres://' + (env.PGHOST || 'localhost') + ':' + (env.PGPORT || 5432) + '/' + options.db + '?max=3', {
+    user: login.user,
+    idle_timeout
+  })
+  const pids = await Promise.all([1, 2, 3].map(() => sql`select pg_backend_pid() as pid, pg_sleep(0.2)`))
+  await sql.end()
+  return ['number,3', [typeof sql.options.max, new Set(pids.map(([x]) => x.pid)).size].toString()]
+})
+
+t('max from PGMAX is a number', async() => {
+  const env = process.env // eslint-disable-line
+  const before = env.PGMAX
+  env.PGMAX = '4'
+  try {
+    const { max, ...rest } = options // eslint-disable-line
+    const opt = postgres(rest).options
+    return ['number,4', [typeof opt.max, opt.max].toString()]
+  } finally {
+    before === undefined ? delete env.PGMAX : env.PGMAX = before
+  }
+})
+
 t('Fail with proper error on no host', async() =>
   ['ECONNREFUSED', (await new Promise((resolve, reject) => {
     const sql = postgres('postgres://localhost:33333/' + options.db, {

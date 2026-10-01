@@ -241,3 +241,8 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   pipeline. A reused description the server rejects (the schema changed under the text) is
   dropped; outside a transaction the statement, which never ran, is described afresh and run
   again, as a stale prepared statement already is.
+- **`max` from the URL or `PGMAX` is a number** (3.8.10). Options read from the URL's
+  query or the environment arrive as strings, and the parser coerces a fixed list of
+  integer options; `max` was missing from it, so `?max=20` gave `Array("20")` - a pool of
+  **one** connection - while `options.max` read `"20"`. Nothing was reported. `max` is now
+  coerced like the others, and the pool opens that many connections.

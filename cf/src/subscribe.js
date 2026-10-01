@@ -228,6 +228,18 @@ export default function Subscribe(postgres, options) {
       , heartbeat = null
       , acking = null
       , acked = state.lsn
+      , heard = Date.now()
+
+    // The watchdog (subscribe_timeout): a status update that asks for a reply
+    // every third of the timeout, and the stream lost when nothing at all came
+    // back for the whole of it. A walsender answers such an update at once with
+    // a keepalive, so silence means the path to it stopped delivering without
+    // closing - which TCP alone would report only when its retransmissions give
+    // up, a quarter of an hour on Linux defaults. Paused (backpressure), the
+    // stream reads nothing by design: the clock restarts on resume.
+    const timeout = (options.subscribe_timeout || 0) * 1000
+        , watchdog = timeout ? setInterval(watch, Math.max(timeout / 3, 10)) : null
+    watchdog && watchdog.unref && watchdog.unref()
 
     stream.on('data', data)
     stream.on('error', error)
@@ -256,7 +268,23 @@ export default function Subscribe(postgres, options) {
       subscribers.forEach(event => event.forEach(({ onerror }) => onerror(e)))
     }
 
+    function watch() {
+      if (paused || stream.destroyed)
+        return
+      if (Date.now() - heard < timeout)
+        return pong(true)
+      const e = Object.assign(
+        new Error('Subscription stream lost: nothing received for ' + timeout / 1000 + ' s'),
+        { code: 'SUBSCRIPTION_TIMEOUT' }
+      )
+      // The connection goes with the stream: its socket is the half-open one.
+      // Its close fails the stream with `e`, which runs the usual teardown,
+      // onerror and reestablish.
+      stream.lose ? stream.lose(e) : stream.destroy(e)
+    }
+
     function data(x) {
+      heard = Date.now()
       if (x[0] === 0x77) {
         parse(x.subarray(25), state, parsers, handle, transform, watched)
       } else if (x[0] === 0x6b) {
@@ -527,6 +555,7 @@ export default function Subscribe(postgres, options) {
       queued -= n
       if (paused && queued <= lwm) {
         paused = false
+        heard = Date.now()
         clearInterval(heartbeat)
         heartbeat = null
         stream.destroyed || stream.resume()
@@ -534,6 +563,7 @@ export default function Subscribe(postgres, options) {
     }
 
     function teardown() {
+      clearInterval(watchdog)
       clearInterval(heartbeat)
       clearTimeout(acking)
       heartbeat = acking = null
@@ -547,7 +577,7 @@ export default function Subscribe(postgres, options) {
       live.clear()
     }
 
-    function pong() {
+    function pong(reply) {
       const x = Buffer.alloc(34)
       x[0] = 'r'.charCodeAt(0)
       if (durable) {
@@ -561,6 +591,8 @@ export default function Subscribe(postgres, options) {
         x.fill(state.lsn, 1)
       }
       x.writeBigInt64BE(BigInt(Date.now() - Date.UTC(2000, 0, 1)) * BigInt(1000), 25)
+      // Reply requested - set explicitly: the fill above runs to the end.
+      x[33] = reply ? 1 : 0
       stream.write(x)
     }
   }

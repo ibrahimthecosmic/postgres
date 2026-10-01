@@ -214,3 +214,30 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   connection has its `end()` deferred until it is released; upstream's `release()` then
   put it back in the pool as an idle connection, and nothing ever settled that `end()`.
   It now closes, like any other connection of an ending pool.
+- **A cancelled statement on a connection that stopped answering loses the connection**
+  (3.8.9). A CancelRequest only reaches a backend that is still there; on a half-open
+  connection (a partition, a NAT dropping state, a failover that moved the address) the
+  statement never settled, and every statement the pool kept routing to that connection
+  hung with it until TCP gave up, a quarter of an hour on Linux defaults. A statement still
+  unsettled `cancel_timeout` seconds (default 2) after its CancelRequest now destroys its
+  connection's socket: what the connection held fails with `CONNECTION_CLOSED`, and the pool
+  replaces it. `cancel_timeout: 0` turns it off. Connections also gained `lose(error)`, a
+  `socket.destroy()` that works where `terminate()`'s polite close waits forever.
+- **The replication stream notices a link that stopped delivering** (3.8.9). Upstream's
+  stream only answered the server's keepalives, so a half-open replication connection left a
+  subscription silent - no changes, no error - until TCP gave up. Every third of
+  `subscribe_timeout` (default 30 s) the stream now sends a status update with *reply
+  requested*, which a walsender answers at once; nothing received for the whole timeout
+  loses the stream's connection, reported to `onerror` with code `SUBSCRIPTION_TIMEOUT`, and
+  the usual re-establishment follows. A paused stream (backpressure) is not watched. The
+  status update's reply byte is also no longer set by accident: `fill()` of the LSN ran to
+  the end of the buffer.
+- **An unprepared statement is described once per text, not on every run** (3.8.9).
+  Upstream described every unprepared parameterized statement before binding it -
+  Parse/Describe, wait, Bind/Execute: two round trips - to learn the parameter types the
+  values did not pin. With `prepare: false` (the transaction-pooler setting) that was every
+  query. Described types are now kept per pool (1,024 texts, oldest first), and a statement
+  whose types are all known - pinned by its values, or described before - goes out as one
+  pipeline. A reused description the server rejects (the schema changed under the text) is
+  dropped; outside a transaction the statement, which never ran, is described afresh and run
+  again, as a stale prepared statement already is.

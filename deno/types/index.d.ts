@@ -154,10 +154,33 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    * @default false
    */
   subscribe_raw: boolean
+  /**
+   * Seconds the replication stream may go without receiving anything before
+   * it is treated as lost. A third of it is the heartbeat: a status update that
+   * asks the server to answer at once, so a quiet but healthy stream is never
+   * mistaken for a dead one. A lost stream's connection is destroyed and the
+   * subscription re-established, reported to `onerror` like any other loss -
+   * without this, a link that stops delivering without closing (a failover that
+   * moves the address, a NAT dropping state) leaves the subscription silent
+   * until TCP gives up, which can take a quarter of an hour.
+   * `0` or `null` disables the check.
+   * @default 30
+   */
+  subscribe_timeout: number | null
   onclose: (connId: number) => void;
   backoff: boolean | ((attemptNum: number) => number);
   max_lifetime: number | null;
   keep_alive: number | null;
+  /**
+   * Seconds a cancelled statement may stay unsettled after its CancelRequest
+   * before its connection is destroyed: a server that answers sends the cancel's
+   * error long before this, so a statement still pending is on a connection
+   * that stopped answering (half-open). Destroyed, the connection fails what it
+   * held with CONNECTION_CLOSED instead of holding it forever.
+   * `0` or `null` disables it.
+   * @default 2
+   */
+  cancel_timeout: number | null;
 }
 
 

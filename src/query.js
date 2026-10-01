@@ -23,10 +23,11 @@ export class Query extends Promise {
     this.state = null
     this.statement = null
 
-    this.resolve = x => (this.active = false, resolve(x))
-    this.reject = x => (this.active = false, reject(x))
+    this.resolve = x => (this.active = false, this.settled = true, resolve(x))
+    this.reject = x => (this.active = false, this.settled = true, reject(x))
 
     this.active = false
+    this.settled = false
     this.cancelled = null
     this.executed = false
     this.startedAt = 0

@@ -4056,3 +4056,139 @@ t('A LISTEN connection keeps the process alive', { timeout: 20 }, async() => {
   clearTimeout(timer)
   return ['0 listening notified', code + ' ' + out.trim().split('\n').join(' ')]
 })
+
+// A TCP proxy in front of the test server that can stall its open
+// connections - stop forwarding both ways without closing anything, a
+// half-open link as a partition or a dropped NAT entry leaves it. Connections
+// opened after the stall pass through. `turns` counts client-to-server
+// chunks, one per round trip the driver starts.
+async function stallingProxy() {
+  const pairs = new Set()
+  const proxy = {
+    turns: 0,
+    stall() {
+      pairs.forEach(p => p.stalled = true)
+    },
+    close() {
+      pairs.forEach(p => (p.a.destroy(), p.b.destroy()))
+      return new Promise(r => server.close(r))
+    }
+  }
+  const server = net.createServer(a => {
+    const b = net.connect(process.env.PGPORT || 5432, process.env.PGHOST || 'localhost') // eslint-disable-line
+        , pair = { a, b, stalled: false }
+    pairs.add(pair)
+    a.on('data', x => pair.stalled || (proxy.turns++, b.write(x)))
+    b.on('data', x => pair.stalled || a.write(x))
+    a.on('error', () => { /* noop */ })
+    b.on('error', () => { /* noop */ })
+    a.on('close', () => (pairs.delete(pair), b.destroy()))
+    b.on('close', () => (pairs.delete(pair), a.destroy()))
+  })
+  await new Promise(r => server.listen(0, '127.0.0.1', r))
+  proxy.port = server.address().port
+  return proxy
+}
+
+t('A cancelled statement on a connection that stopped answering loses the connection', async() => {
+  const proxy = await stallingProxy()
+  const sql = postgres({ ...options, host: '127.0.0.1', port: proxy.port, cancel_timeout: 0.3 }) // eslint-disable-line
+  await sql`select 1`
+  proxy.stall()
+  const query = sql`select 2 as x`.execute()
+  await delay(50)
+  const start = Date.now()
+  query.cancel().catch(() => { /* the cancel's own connection may fail; the grace still runs */ })
+  const error = await query.catch(x => x)
+  const took = Date.now() - start
+  // The pool replaced it: the next statement opens a fresh connection.
+  const x = (await sql`select 3 as x`)[0].x
+  await sql.end({ timeout: 0 })
+  await proxy.close()
+  return ['CONNECTION_CLOSED true 3', error.code + ' ' + (took < 1000) + ' ' + x]
+})
+
+t('A cancelled statement on a stalled connection waits without cancel_timeout', async() => {
+  const proxy = await stallingProxy()
+  const sql = postgres({ ...options, host: '127.0.0.1', port: proxy.port, cancel_timeout: 0 }) // eslint-disable-line
+  await sql`select 1`
+  proxy.stall()
+  const query = sql`select 2 as x`.execute()
+  query.catch(() => { /* settled by the teardown */ })
+  await delay(50)
+  query.cancel().catch(() => { /* noop */ })
+  await delay(600)
+  const settled = query.settled
+  await sql.end({ timeout: 0 })
+  await proxy.close()
+  return [false, settled]
+})
+
+t('subscribe loses a stream that stopped answering and re-establishes it', { timeout: 10 }, async() => {
+  const proxy = await stallingProxy()
+  const sql = postgres({ database: 'postgres_js_test' })
+  // Only the replication connection goes through the proxy: this pool never
+  // opens one of its own.
+  const through = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false,
+    host: '127.0.0.1',
+    port: proxy.port,
+    subscribe_timeout: 0.6
+  })
+  await sql.unsafe('create publication alltables for all tables')
+  const errors = []
+  let onsubscribes = 0
+  const { unsubscribe } = await through.subscribe(
+    'transaction',
+    () => { /* noop */ },
+    () => onsubscribes++,
+    e => errors.push(e.code)
+  )
+  // Quiet but healthy: the heartbeat's reply keeps the stream alive past
+  // the timeout.
+  await delay(1000)
+  const before = errors.length + ' ' + onsubscribes
+  proxy.stall()
+  while (onsubscribes < 2) // eslint-disable-line
+    await delay(20)
+  await unsubscribe()
+  const result = before + ' ' + errors[0] + ' ' + onsubscribes
+  await sql`drop publication alltables`
+  await sql.end()
+  await through.end({ timeout: 0 })
+  await proxy.close()
+  return ['0 1 SUBSCRIPTION_TIMEOUT 2', result]
+})
+
+t('An unprepared statement is described once per text, then runs in one round trip', async() => {
+  const proxy = await stallingProxy()
+  const sql = postgres({ ...options, host: '127.0.0.1', port: proxy.port, prepare: false }) // eslint-disable-line
+  await sql`select 1`
+  const turns = async q => {
+    const before = proxy.turns
+    await q
+    return proxy.turns - before
+  }
+  const first = await turns(sql`select ${ 'a' } as x`)
+  const second = await turns(sql`select ${ 'b' } as x`)
+  // Every type pinned by the values: never described first.
+  const pinned = await turns(sql`select ${ true } as x, ${ new Date(0) } as y`)
+  await sql.end()
+  await proxy.close()
+  return ['2 1 1', first + ' ' + second + ' ' + pinned]
+})
+
+t('A reused description that no longer fits is described again and run', async() => {
+  const sql = postgres({ ...options, prepare: false }) // eslint-disable-line
+  await sql`create table test (x int)`
+  await sql`insert into test values (1)`
+  const a = await sql`select x from test where x = ${ '1' }`
+  await sql`alter table test alter x type text`
+  await sql`insert into test values ('b')`
+  // Described before as int4: 'b' fails to bind as that, nothing ran, and the
+  // statement is described afresh and run as text.
+  const b = await sql`select x from test where x = ${ 'b' }`
+  return ['1 b', a[0].x + ' ' + b[0].x, await sql`drop table test`, await sql.end()]
+})

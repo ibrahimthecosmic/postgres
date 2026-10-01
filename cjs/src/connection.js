@@ -22,6 +22,26 @@ const Sync = b().S().end()
     , DescribeUnnamed = b().D().str('S').str(b.N).end()
     , noop = () => { /* noop */ }
 
+// Parameter types the server described for a statement text, per pool (the
+// options object is the pool's), so that a statement that is not prepared -
+// prepare: false, or past what the caller prepares - is described once, not
+// on every run. Bounded: the oldest description goes first.
+const descriptions = new WeakMap()
+    , maxDescriptions = 1024
+
+function described(options) {
+  let x = descriptions.get(options)
+  x || descriptions.set(options, x = new Map())
+  return x
+}
+
+function learn(options, key, types) {
+  const x = described(options)
+  x.delete(key)
+  x.set(key, types.slice())
+  x.size > maxDescriptions && x.delete(x.keys().next().value)
+}
+
 const retryRoutines = new Set([
   'FetchPreparedStatement',
   'RevalidateCachedQuery',
@@ -107,6 +127,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     , nonce = null
     , query = null
     , idleFatal = null
+    , lostError = null
     , final = null
 
   const connection = {
@@ -119,6 +140,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     terminate,
     execute,
     cancel,
+    lose,
+    unanswered,
     end,
     ref,
     release,
@@ -176,6 +199,32 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     } catch (error) {
       reject(error)
     }
+  }
+
+  // Destroy the socket outright: unlike terminate(), which ends it politely
+  // and waits for the server's side of the close, this works on a connection
+  // whose far end stopped answering (half-open) - the close it causes fails
+  // what the connection held with `error`, and the pool replaces it.
+  function lose(error) {
+    if (!socket)
+      return
+    lostError = error
+    socket.destroy()
+  }
+
+  // A CancelRequest went out for q, running on this connection. A server that
+  // is there answers it within a round trip or two (57014, or the statement's
+  // own result); q still unsettled cancel_timeout seconds later is on a
+  // connection that stopped answering, and every statement routed to it would
+  // hang with it. Lose it instead.
+  function unanswered(q) {
+    const seconds = options.cancel_timeout
+    if (!seconds)
+      return
+    const timer = setTimeout(() => {
+      q.settled || lose(Errors.connection('CONNECTION_CLOSED', options, socket || undefined))
+    }, seconds * 1000)
+    timer.unref && timer.unref()
   }
 
   function execute(q) {
@@ -265,7 +314,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     q.onlyDescribe && (delete statements[q.signature])
     q.parameters = q.parameters || parameters
     q.prepared = q.prepare && q.signature in statements
-    q.describeFirst = q.onlyDescribe || (parameters.length && !q.prepared)
+    q.described = null
+    // Describing first costs a round trip: Parse/Describe, wait for the
+    // parameter types, then Bind/Execute. It is only needed for the types the
+    // values did not pin, and only to pick their serializers - so not at all
+    // when every type is pinned, nor when an earlier description of the same
+    // text (any connection of this pool) already told us. Those statements go
+    // out as one pipeline.
+    if (parameters.length && !q.prepared && !q.onlyDescribe) {
+      const known = types.every(x => x)
+      q.described = known ? null : types + string
+      const learned = !known && described(options).get(q.described)
+      learned && learned.forEach((x, i) => types[i] = x)
+      q.guessed = !!learned
+      q.describeFirst = !known && !learned
+    } else {
+      q.guessed = false
+      q.describeFirst = q.onlyDescribe || (parameters.length && !q.prepared)
+    }
     q.statement = q.prepared
       ? statements[q.signature]
       : { string, types, name: q.prepare ? statementId + statementCount++ : '' }
@@ -501,7 +567,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     // event, and a multi-host connection still in `connecting`, which error()
     // spares so that the next host can be tried - a query already sent can't be.
     if (!initial && (query || sent.length)) {
-      const err = errorResponse || Errors.connection('CONNECTION_CLOSED', options, socket)
+      const err = errorResponse || lostError || Errors.connection('CONNECTION_CLOSED', options, socket)
       errored(err)
       while (sent.length)
         queryError(sent.shift(), err)
@@ -512,7 +578,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     // query in line, and a half-read row stream offsets that query's rows. A
     // socket that closes while starting up is simply reopened: all it owed was
     // the startup's own internal queries.
-    query = results = errorResponse = null
+    query = results = errorResponse = lostError = null
     result = new Result()
     rows = 0
 
@@ -607,11 +673,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   function ReadyForQuery(x) {
     if (query) {
       if (errorResponse) {
+        query.guessed && !query.bound && described(options).delete(query.described)
         query.retried
           ? errored(Object.assign(errorResponse, { cause: query.retried }))
           : query.prepared && retryRoutines.has(errorResponse.routine)
             ? retry(query, errorResponse)
-            : errored(errorResponse)
+            // Parameter types reused from an earlier description that no longer
+            // fit (the schema changed under the text): nothing ran, so outside a
+            // transaction it is safe to describe afresh and run it again.
+            : query.guessed && !query.bound && x[5] === 73 // I
+              ? (query.parameters = null, retry(query, errorResponse))
+              : errored(errorResponse)
       } else {
         query.resolve(results || result)
       }
@@ -653,8 +725,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         return
     }
 
-    while (sent.length && (query = sent.shift()) && (start(query), query.cancelled))
+    while (sent.length && (query = sent.shift()) && (start(query), query.cancelled)) {
       Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
+      unanswered(query)
+    }
 
     if (query)
       return // Consider opening if able and sent.length < 50
@@ -702,6 +776,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function BindComplete() {
+    query.bound = true
     !result.statement && (result.statement = query.statement)
     result.columns = query.statement.columns
   }
@@ -712,6 +787,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     for (let i = 0; i < length; ++i)
       !query.statement.types[i] && (query.statement.types[i] = x.readUInt32BE(7 + i * 4))
 
+    query.described && !query.guessed && learn(options, query.described, query.statement.types)
     query.prepare && (statements[query.signature] = query.statement)
     query.describeFirst && !query.onlyDescribe && (write(prepared(query)), query.describeFirst = false)
   }
@@ -922,11 +998,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   // a connection or behind another statement. A retry keeps the first mark.
   function start(q) {
     q.active = true
+    q.connection = connection
     q.startedAt || (q.startedAt = performance.now())
   }
 
   function retry(q, error) {
     delete statements[q.signature]
+    // The same text's reusable description is as stale as the plan was (the
+    // signature is the description's key, types + text).
+    q.signature && described(options).delete(q.signature)
     q.retried = error
     execute(q)
   }
@@ -976,7 +1056,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       },
       destroy(error, callback) {
         callback(error)
-        socket.write(b().f().str(error + b.N).end())
+        // The socket may be gone already: closed() destroys the stream after
+        // the socket closed under it.
+        socket && socket.write(b().f().str(error + b.N).end())
         stream = null
       },
       final(callback) {
@@ -1006,7 +1088,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       },
       destroy(error, callback) {
         callback(error)
-        socket.write(b().f().str(error + b.N).end())
+        // The socket may be gone already: closed() destroys the stream after
+        // the socket closed under it.
+        socket && socket.write(b().f().str(error + b.N).end())
         stream = null
       },
       final(callback) {
@@ -1014,6 +1098,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         final = callback
       }
     })
+    // The replication stream's watchdog (subscribe.js) needs the connection
+    // under the stream gone when the stream stops delivering: ending the
+    // stream alone would leave its half-open socket holding the pool's one
+    // connection, and the re-established subscription would queue behind it.
+    stream.lose = lose
     query.resolve(stream)
   }
 

@@ -411,7 +411,7 @@ function Postgres(a, b) {
     return new Promise((resolve, reject) => {
       query.state
         ? query.active
-          ? Connection(options).cancel(query.state, resolve, reject)
+          ? (Connection(options).cancel(query.state, resolve, reject), query.connection.unanswered(query))
           : query.cancelled = { resolve, reject }
         : (
           queries.remove(query),
@@ -551,7 +551,7 @@ function parseOptions(a, b) {
   'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
   query.sslrootcert === 'system' && (query.ssl = 'verify-full')
 
-  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'subscribe_high_water_mark']
+  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'subscribe_high_water_mark', 'subscribe_timeout', 'cancel_timeout']
   const defaults = {
     max             : globalThis.Cloudflare ? 3 : 10,
     ssl             : false,
@@ -562,6 +562,7 @@ function parseOptions(a, b) {
     max_pipeline    : 100,
     backoff         : backoff,
     keep_alive      : 60,
+    cancel_timeout  : 2,
     prepare         : true,
     debug           : false,
     fetch_types     : true,
@@ -570,6 +571,7 @@ function parseOptions(a, b) {
     subscribe_high_water_mark: 1024,
     subscribe_tables: null,
     subscribe_raw   : false,
+    subscribe_timeout: 30,
     target_session_attrs: null
   }
 

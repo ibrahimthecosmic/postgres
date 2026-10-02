@@ -254,3 +254,10 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   server, yet it counted too: the callback could catch it, carry on and return, and
   `begin()` rejected anyway with that `57014`. It is the caller's rejection alone now, and
   the transaction commits. A statement cancelled once written still fails it.
+- **The first call of a statement no longer pins its arguments** (3.8.12). A tagged query's
+  origin (the stack an error reports) is captured once per strings array and cached for the
+  array's life. V8 formats a stack lazily, and until then it holds its frames' functions,
+  and through their closures whatever the caller held: the first call's arguments among
+  them. A library building a 100,000-row batch through a memoized strings array kept
+  ~370 MB alive for the life of the process. The stack is formatted at capture now, and
+  both caches are keyed weakly. Upstream has the same code.

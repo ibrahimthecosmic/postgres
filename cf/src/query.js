@@ -1,5 +1,5 @@
-const originCache = new Map()
-    , originStackCache = new Map()
+const originCache = new WeakMap()
+    , originStackCache = new WeakMap()
     , originError = Symbol('OriginError')
 
 export const CLOSE = {}
@@ -195,7 +195,12 @@ function cachedError(xs) {
 
   const x = Error.stackTraceLimit
   Error.stackTraceLimit = 4
-  originCache.set(xs, new Error())
+  const error = new Error()
   Error.stackTraceLimit = x
-  return originCache.get(xs)
+  // Format the stack now: an unformatted one holds its frames' functions
+  // and receivers, and through their closures the first call's arguments,
+  // for as long as the strings array lives.
+  error.stack // eslint-disable-line
+  originCache.set(xs, error)
+  return error
 }

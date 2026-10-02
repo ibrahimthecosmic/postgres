@@ -4259,3 +4259,28 @@ t('A reused description that no longer fits is described again and run', async()
   const b = await sql`select x from test where x = ${ 'b' }`
   return ['1 b', a[0].x + ' ' + b[0].x, await sql`drop table test`, await sql.end()]
 })
+
+t('The first call of a statement does not pin its arguments', async() => {
+  // The origin of a tagged query is captured once per strings array. An
+  // unformatted V8 stack keeps its frames' functions alive, and with them
+  // what their closures hold: here the first call's argument.
+  const v8 = await import('v8')
+  const vm = await import('vm')
+  v8.setFlagsFromString('--expose-gc')
+  const gc = vm.runInNewContext('gc')
+  const strings = Object.assign(['select length(', '::bytea) as x'], { raw: ['select length(', '::bytea) as x'] })
+  let ref
+  const first = async() => {
+    const held = { bytes: Buffer.alloc(1 << 20) }
+    const build = () => sql(strings, held.bytes)
+    ref = new globalThis.WeakRef(held)
+    return (await build())[0].x
+  }
+  const length = await first()
+  await sql(strings, Buffer.alloc(1))
+  await delay(10)
+  gc()
+  await delay(10)
+  gc()
+  return [true, length === 1 << 20 && ref.deref() === undefined]
+})

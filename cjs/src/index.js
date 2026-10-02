@@ -308,8 +308,13 @@ function Postgres(a, b) {
         return scope(c, fn, 's' + savepoints++ + (name ? '_' + name : ''))
       }
 
+      // A statement that failed fails the transaction even when the callback
+      // catches it: the server aborted the transaction. One cancelled while
+      // it still sat in this scope's queue (cancelled === true, not the
+      // CancelRequest a written one gets) never reached the server, so
+      // nothing was aborted - its rejection is the caller's alone.
       function handler(q) {
-        q.catch(e => uncaughtError || (uncaughtError = e))
+        q.catch(e => uncaughtError || q.cancelled === true || (uncaughtError = e))
         lost || done
           ? q.reject(lost || done)
           : c.queue === full

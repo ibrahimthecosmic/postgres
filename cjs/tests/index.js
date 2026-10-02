@@ -3265,7 +3265,9 @@ t('Cancel while queued behind a cursor in a transaction', async() => {
   // dispatched while it walks lands in the transaction's own queue. Cancelling
   // one of those wrote nothing, so the drain must skip it rather than spend the
   // transaction's next turn on it - there is no further ReadyForQuery coming.
-  const error = await sql.begin(async sql => {
+  // Nothing reached the server either, so the caught cancel does not fail the
+  // transaction: it commits.
+  const result = await sql.begin(async sql => {
     const walk = sql`select i from generate_series(1, 3) i`
       .cursor(() => delay(20))
       .execute()
@@ -3279,9 +3281,50 @@ t('Cancel while queued behind a cursor in a transaction', async() => {
 
     await walk
     after = (await sql`select 2 as x`)[0].x
-  }).catch(x => x)
+    return 'committed'
+  }).catch(x => x.code)
 
-  return ['57014 2', error.code + ' ' + after, await sql.end()]
+  return ['committed 2', result + ' ' + after, await sql.end()]
+})
+
+t('A statement cancelled before it was written does not fail its transaction', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  await sql`create table test (x int)`
+  let error
+  // The first run of a statement with parameters describes before it
+  // executes, which parks the connection as full: the select behind it waits
+  // in the transaction's own queue, and the cancel dequeues it.
+  const result = await sql.begin(async sql => {
+    const hold = sql`select pg_sleep(${ 0.2 })`.execute()
+    await new Promise(r => setImmediate(r))
+    const query = sql`select 1 as x`
+    query.execute()
+    await new Promise(r => setImmediate(r))
+    await query.cancel()
+    error = await query.catch(x => x.code)
+    await hold
+    await sql`insert into test values (1)`
+    return 'committed'
+  }).catch(x => x.code)
+  const [{ n }] = await sql`select count(*)::int as n from test`
+
+  return ['57014 committed 1', error + ' ' + result + ' ' + n, await sql`drop table test`, await sql.end()]
+})
+
+t('A statement cancelled while running still fails its transaction', async() => {
+  const sql = postgres(options) // eslint-disable-line
+  // The server cancelled it, so the transaction is aborted: catching the
+  // cancel does not let the callback carry on into a commit.
+  const result = await sql.begin(async sql => {
+    const query = sql`select pg_sleep(1)`
+    query.execute()
+    await delay(50)
+    await query.cancel()
+    await query.catch(() => { /* noop */ })
+    return 'committed'
+  }).catch(x => x.code)
+
+  return ['57014', result, await sql.end()]
 })
 
 t('Cancel while queued behind a cursor in a reserved connection', async() => {

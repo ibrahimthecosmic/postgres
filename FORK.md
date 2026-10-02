@@ -246,3 +246,11 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   integer options; `max` was missing from it, so `?max=20` gave `Array("20")` - a pool of
   **one** connection - while `options.max` read `"20"`. Nothing was reported. `max` is now
   coerced like the others, and the pool opens that many connections.
+- **A statement cancelled before it was written does not fail its transaction** (3.8.11).
+  Inside `begin()`, a statement that fails fails the transaction even when the callback
+  catches it, because the server aborted the transaction. One cancelled while it still sat
+  in the transaction's own queue (behind a statement that parked the connection as full: a
+  describe-first run, a cursor) was rejected with `57014` locally and never reached the
+  server, yet it counted too: the callback could catch it, carry on and return, and
+  `begin()` rejected anyway with that `57014`. It is the caller's rejection alone now, and
+  the transaction commits. A statement cancelled once written still fails it.

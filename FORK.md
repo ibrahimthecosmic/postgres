@@ -261,3 +261,6 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   them. A library building a 100,000-row batch through a memoized strings array kept
   ~370 MB alive for the life of the process. The stack is formatted at capture now, and
   both caches are keyed weakly. Upstream has the same code.
+- **...on Deno too** (3.8.13). Deno keeps an Error's call sites after its stack is formatted,
+  so 3.8.12 still pinned the first call there. The cache holds the stack's text alone now,
+  formatted at capture on every runtime.

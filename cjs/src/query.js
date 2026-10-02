@@ -1,5 +1,4 @@
 const originCache = new WeakMap()
-    , originStackCache = new WeakMap()
     , originError = Symbol('OriginError')
 
 const CLOSE = module.exports.CLOSE = {}
@@ -35,15 +34,13 @@ const Query = module.exports.Query = class Query extends Promise {
 
     this[originError] = this.handler.debug
       ? new Error()
-      : this.tagged && cachedError(this.strings)
+      : this.tagged && cachedStack(this.strings)
   }
 
   get origin() {
     return (this.handler.debug
       ? this[originError].stack
-      : this.tagged && originStackCache.has(this.strings)
-        ? originStackCache.get(this.strings)
-        : originStackCache.set(this.strings, this[originError].stack).get(this.strings)
+      : this[originError]
     ) || ''
   }
 
@@ -189,18 +186,18 @@ const Query = module.exports.Query = class Query extends Promise {
   }
 }
 
-function cachedError(xs) {
+function cachedStack(xs) {
   if (originCache.has(xs))
     return originCache.get(xs)
 
   const x = Error.stackTraceLimit
   Error.stackTraceLimit = 4
-  const error = new Error()
+  // Only the text is kept: an Error holds its frames' functions and
+  // receivers - and through their closures the first call's arguments - for
+  // as long as the strings array lives: unformatted on V8, and formatted
+  // too on Deno.
+  const stack = new Error().stack
   Error.stackTraceLimit = x
-  // Format the stack now: an unformatted one holds its frames' functions
-  // and receivers, and through their closures the first call's arguments,
-  // for as long as the strings array lives.
-  error.stack // eslint-disable-line
-  originCache.set(xs, error)
-  return error
+  originCache.set(xs, stack)
+  return stack
 }

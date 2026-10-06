@@ -2,7 +2,6 @@ const net = require('net')
 const tls = require('tls')
 const crypto = require('crypto')
 const Stream = require('stream')
-const { performance } = require('perf_hooks')
 
 const { stringify, handleValue, arrayParser, arraySerializer } = require('./types.js')
 const { Errors } = require('./errors.js')
@@ -10,6 +9,7 @@ const Result = require('./result.js')
 const Queue = require('./queue.js')
 const { Query, CLOSE } = require('./query.js')
 const b = require('./bytes.js')
+const { setTimeout, clearTimeout, setImmediate, clearImmediate, now } = require('./timers.js')
 
 module.exports = Connection
 
@@ -463,7 +463,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function reconnect() {
-    setTimeout(connect, closedTime ? Math.max(0, closedTime + delay - performance.now()) : 0)
+    setTimeout(connect, closedTime ? Math.max(0, closedTime + delay - now()) : 0)
   }
 
   function connected() {
@@ -585,7 +585,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (initial)
       return reconnect()
 
-    closedTime = performance.now()
+    closedTime = now()
     hadError && options.shared.retries++
     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
     onclose(connection, idleFatal || Errors.connection('CONNECTION_CLOSED', options, socket))
@@ -999,7 +999,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   function start(q) {
     q.active = true
     q.connection = connection
-    q.startedAt || (q.startedAt = performance.now())
+    q.startedAt || (q.startedAt = now())
   }
 
   function retry(q, error) {

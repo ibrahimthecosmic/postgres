@@ -25,6 +25,7 @@ import Queue from './queue.js'
 import { Errors, PostgresError } from './errors.js'
 import Subscribe from './subscribe.js'
 import largeObject from './large.js'
+import { setTimeout, clearTimeout } from './timers.js'
 
 Object.assign(Postgres, {
   PostgresError,

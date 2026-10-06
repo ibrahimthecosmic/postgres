@@ -66,7 +66,7 @@ function transpile(x, name, folder) {
     ? 'import process from \'' + std + 'node/process.ts\'\n'
     : ''
 
-  const timers = x.includes('setImmediate')
+  const timers = x.includes('setImmediate') && !x.includes('from \'./timers.js\'')
     ? 'import { setImmediate, clearImmediate } from \'../polyfills.js\'\n'
     : ''
 

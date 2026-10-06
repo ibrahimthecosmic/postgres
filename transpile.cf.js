@@ -16,7 +16,7 @@ fs.readdirSync('src').forEach(name =>
 )
 
 function transpile(x) {
-  const timers = x.includes('setImmediate')
+  const timers = x.includes('setImmediate') && !x.includes('from \'./timers.js\'')
     ? 'import { setImmediate, clearImmediate } from \'../polyfills.js\'\n'
     : ''
 

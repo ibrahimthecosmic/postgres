@@ -4284,3 +4284,55 @@ t('The first call of a statement does not pin its arguments', async() => {
   gc()
   return [true, length === 1 << 20 && ref.deref() === undefined]
 })
+
+t('Queries, connects and transactions keep real time once the timer globals are faked', async() => {
+  // What vi.useFakeTimers() and friends do after the driver is loaded: every
+  // timer global replaced by one that never fires. Faking setImmediate hung
+  // every query (the write batching), setTimeout every new connection.
+  const names = ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate']
+      , saved = names.map(name => globalThis[name])
+      , realDelay = saved[0]
+      , now = Date.now
+  let result
+  try {
+    names.forEach(name => globalThis[name] = () => 0)
+    Date.now = () => 0
+    const fresh = postgres({ ...options, max: 2, idle_timeout: 0.05 }) // eslint-disable-line
+    const [{ x }] = await fresh`select 1 as x`
+    const [{ y }] = await fresh.begin(sql => sql`select 2 as y`)
+    await new Promise(r => realDelay(r, 120))
+    // The idle timeout fired on the real clock: this query reconnects.
+    const [{ z }] = await fresh`select 3 as z`
+    await fresh.end({ timeout: 1 })
+    result = '' + x + y + z
+  } finally {
+    names.forEach((name, i) => saved[i] !== undefined && (globalThis[name] = saved[i]))
+    Date.now = now
+  }
+  return ['123', result]
+})
+
+t('subscribe reports how long its stream has been quiet, keepalives included', { timeout: 10 }, async() => {
+  const sql = postgres({ database: 'postgres_js_test' })
+  const stream = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false,
+    subscribe_timeout: 0.6
+  })
+  await sql.unsafe('create publication alltables for all tables')
+  const handle = await stream.subscribe('transaction', () => { /* noop */ })
+  const first = handle.quietMs
+  // No writes: the watchdog's reply requests every 200 ms bring keepalives,
+  // so an idle healthy stream never reads quiet for long.
+  let most = 0
+  for (let i = 0; i < 10; i++) {
+    await delay(100)
+    most = Math.max(most, handle.quietMs)
+  }
+  handle.unsubscribe()
+  await sql`drop publication alltables`
+  await sql.end()
+  await stream.end({ timeout: 0 })
+  return [true, typeof first === 'number' && first >= 0 && most < 500]
+})

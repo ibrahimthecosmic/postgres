@@ -1,4 +1,5 @@
 import { Errors } from './errors.js'
+import { setTimeout, clearTimeout, setInterval, clearInterval, wallNow, now } from './timers.js'
 
 const noop = () => { /* noop */ }
 
@@ -13,6 +14,7 @@ export default function Subscribe(postgres, options) {
     , stream
     , flush
     , position
+    , quiet
     , resumed = false
     , durable = !!options.slot
     , slot = options.slot || 'postgresjs_' + Math.random().toString(36).slice(2)
@@ -130,7 +132,12 @@ export default function Subscribe(postgres, options) {
     return connection.then(x => {
       connected(x)
       onsubscribe(info())
-      return { unsubscribe, drop, state, sql, get slot() { return slot }, get position() { return position ? position() : null } }
+      return {
+        unsubscribe, drop, state, sql,
+        get slot() { return slot },
+        get position() { return position ? position() : null },
+        get quietMs() { return quiet ? quiet() : null }
+      }
     })
   }
 
@@ -185,6 +192,7 @@ export default function Subscribe(postgres, options) {
     stream = x.stream
     flush = x.flush
     position = x.position
+    quiet = x.quiet
     resumed = x.resumed
     state.pid = x.state.pid
     state.secret = x.state.secret
@@ -227,7 +235,7 @@ export default function Subscribe(postgres, options) {
       , heartbeat = null
       , acking = null
       , acked = state.lsn
-      , heard = Date.now()
+      , heard = now()
 
     // The watchdog (subscribe_timeout): a status update that asks for a reply
     // every third of the timeout, and the stream lost when nothing at all came
@@ -246,8 +254,11 @@ export default function Subscribe(postgres, options) {
     stream.on('close', reestablish)
 
     // The position this stream reports as flushed/applied on its next
-    // status update - a durable slot resumes exactly here.
-    return { stream, state: xs.state, flush, resumed, position: () => Lsn(durable ? acked : state.lsn, 0) }
+    // status update - a durable slot resumes exactly here. `quiet`: how long
+    // since the stream last delivered anything, keepalives included - an idle
+    // stream's keepalives keep resetting it, a stalled one's grows (it keeps
+    // growing across a reconnect until the new stream delivers).
+    return { stream, state: xs.state, flush, resumed, position: () => Lsn(durable ? acked : state.lsn, 0), quiet: () => now() - heard }
 
     // Send a scheduled ack now rather than losing it to the close - anything
     // acked but unconfirmed would simply be redelivered on the next connect.
@@ -270,7 +281,7 @@ export default function Subscribe(postgres, options) {
     function watch() {
       if (paused || stream.destroyed)
         return
-      if (Date.now() - heard < timeout)
+      if (now() - heard < timeout)
         return pong(true)
       const e = Object.assign(
         new Error('Subscription stream lost: nothing received for ' + timeout / 1000 + ' s'),
@@ -283,7 +294,7 @@ export default function Subscribe(postgres, options) {
     }
 
     function data(x) {
-      heard = Date.now()
+      heard = now()
       if (x[0] === 0x77) {
         parse(x.subarray(25), state, parsers, handle, transform, watched)
       } else if (x[0] === 0x6b) {
@@ -554,7 +565,7 @@ export default function Subscribe(postgres, options) {
       queued -= n
       if (paused && queued <= lwm) {
         paused = false
-        heard = Date.now()
+        heard = now()
         clearInterval(heartbeat)
         heartbeat = null
         stream.destroyed || stream.resume()
@@ -589,7 +600,7 @@ export default function Subscribe(postgres, options) {
       } else {
         x.fill(state.lsn, 1)
       }
-      x.writeBigInt64BE(BigInt(Date.now() - Date.UTC(2000, 0, 1)) * BigInt(1000), 25)
+      x.writeBigInt64BE(BigInt(wallNow() - Date.UTC(2000, 0, 1)) * BigInt(1000), 25)
       // Reply requested - set explicitly: the fill above runs to the end.
       x[33] = reply ? 1 : 0
       stream.write(x)

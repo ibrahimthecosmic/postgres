@@ -1,11 +1,9 @@
 import { HmacSha256 } from 'https://deno.land/std@0.132.0/hash/sha256.ts'
 import { Buffer } from 'https://deno.land/std@0.132.0/node/buffer.ts'
-import { setImmediate, clearImmediate } from '../polyfills.js'
 import { net } from '../polyfills.js'
 import { tls } from '../polyfills.js'
 import crypto from 'https://deno.land/std@0.132.0/node/crypto.ts'
 import Stream from 'https://deno.land/std@0.132.0/node/stream.ts'
-
 
 import { stringify, handleValue, arrayParser, arraySerializer } from './types.js'
 import { Errors } from './errors.js'
@@ -13,6 +11,7 @@ import Result from './result.js'
 import Queue from './queue.js'
 import { Query, CLOSE } from './query.js'
 import b from './bytes.js'
+import { setTimeout, clearTimeout, setImmediate, clearImmediate, now } from './timers.js'
 
 export default Connection
 
@@ -466,7 +465,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function reconnect() {
-    setTimeout(connect, closedTime ? Math.max(0, closedTime + delay - performance.now()) : 0)
+    setTimeout(connect, closedTime ? Math.max(0, closedTime + delay - now()) : 0)
   }
 
   function connected() {
@@ -588,7 +587,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (initial)
       return reconnect()
 
-    closedTime = performance.now()
+    closedTime = now()
     hadError && options.shared.retries++
     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
     onclose(connection, idleFatal || Errors.connection('CONNECTION_CLOSED', options, socket))
@@ -1002,7 +1001,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   function start(q) {
     q.active = true
     q.connection = connection
-    q.startedAt || (q.startedAt = performance.now())
+    q.startedAt || (q.startedAt = now())
   }
 
   function retry(q, error) {

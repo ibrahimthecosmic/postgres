@@ -264,3 +264,13 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
 - **...on Deno too** (3.8.13). Deno keeps an Error's call sites after its stack is formatted,
   so 3.8.12 still pinned the first call there. The cache holds the stack's text alone now,
   formatted at capture on every runtime.
+- **Real time under a test runner's fake timers** (3.8.14). The timers and clocks the
+  driver schedules with are taken once when it loads (`src/timers.js`), so
+  `vi.useFakeTimers()`, Jest's, `@sinonjs/fake-timers` or Deno's `FakeTime` installed
+  later cannot reach them: faking `setImmediate` alone hung every query (the write
+  batching), faking `setTimeout` every new connection. Durations (the subscribe
+  watchdog's silence, the reconnect delay) read the monotonic clock, so a host clock step
+  cannot stretch or shrink them.
+- **`SubscriptionHandle.quietMs`** (3.8.14): milliseconds since the stream last delivered
+  anything, keepalives included — an idle stream's keepalives keep it low, a stalled
+  one's grows (through a reconnect too, until the new stream delivers).

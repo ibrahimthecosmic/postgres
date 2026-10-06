@@ -594,6 +594,14 @@ declare namespace postgres {
      * across quiet stretches). Null before the stream is established.
      */
     readonly position: string | null;
+    /**
+     * Milliseconds since the stream last delivered anything - data or a keepalive -
+     * on the monotonic clock. An idle stream's keepalives keep resetting it (at most
+     * `wal_sender_timeout` / 2 apart, 30 s by default); a stalled stream's grows,
+     * through a reconnect too, until the new stream delivers. Null before the
+     * stream is established.
+     */
+    readonly quietMs: number | null;
   }
 
   interface SubscribeOptions {

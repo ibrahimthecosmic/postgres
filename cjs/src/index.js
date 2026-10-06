@@ -24,6 +24,7 @@ const Queue = require('./queue.js')
 const { Errors, PostgresError } = require('./errors.js')
 const Subscribe = require('./subscribe.js')
 const largeObject = require('./large.js')
+const { setTimeout, clearTimeout } = require('./timers.js')
 
 Object.assign(Postgres, {
   PostgresError,

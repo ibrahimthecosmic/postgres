@@ -274,3 +274,11 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
 - **`SubscriptionHandle.quietMs`** (3.8.14): milliseconds since the stream last delivered
   anything, keepalives included — an idle stream's keepalives keep it low, a stalled
   one's grows (through a reconnect too, until the new stream delivers).
+- **A statement answered with `57P05` runs again on a fresh connection** (3.8.15).
+  Postgres ends an idle session with `57P05` (`idle_session_timeout`) only while nothing
+  is in flight on it, so a statement answered with it was written after the session was
+  already gone and never ran: a process frozen past the timeout (a laptop's sleep, a
+  serverless thaw) writes its first statement to the reaped pooled connection before it
+  reads the server's goodbye. Outside a reserved scope (`begin`, `reserve`: the session and
+  its state went with it) each such statement goes back to the pool once, for a fresh
+  connection. A cursor, and a statement already sent again, fail with the error as before.

@@ -3674,6 +3674,33 @@ t('A terminated backend fails its own query with its error, not the next one', a
   return ['57P01 1', (await query).code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
 })
 
+// The event loop blocked past `ms` - a process frozen by a laptop's sleep or a
+// serverless thaw, as the server sees it.
+function freeze(ms) {
+  const until = Date.now() + ms
+  while (Date.now() < until)
+    Math.random()
+}
+
+t('A statement answered with 57P05 runs again on a fresh connection', async() => {
+  const sql = postgres({ ...options, max: 1 }) // eslint-disable-line
+  const [{ pid }] = await sql`select pg_backend_pid() as pid`
+  await sql`set idle_session_timeout = '100ms'`
+  freeze(400)
+  const [{ x, other }] = await sql`select 1 as x, pg_backend_pid() <> ${ pid } as other`
+  return ['1 true', x + ' ' + other, await sql.end()]
+})
+
+t('A reserved connection answered with 57P05 fails with it', async() => {
+  const sql = postgres({ ...options, max: 1 }) // eslint-disable-line
+  const reserved = await sql.reserve()
+  await reserved`set idle_session_timeout = '100ms'`
+  freeze(400)
+  const error = await reserved`select 1 as x`.catch(e => e)
+  reserved.release()
+  return ['57P05 1', error.code + ' ' + (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
 t('End settles after a backend is terminated mid-query', async() => {
   const sql = postgres(options) // eslint-disable-line
   const [{ pid }] = await sql`select pg_backend_pid() as pid`

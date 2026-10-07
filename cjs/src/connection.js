@@ -69,7 +69,7 @@ const errorFields = {
   82  : 'routine'            // R
 }
 
-function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onending = () => false } = {}) {
+function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onending = () => false, onresend = null } = {}) {
   const {
     sslnegotiation,
     ssl,
@@ -129,6 +129,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     , idleFatal = null
     , lostError = null
     , final = null
+    , again = []
 
   const connection = {
     queue: queues.closed,
@@ -494,6 +495,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (connection.queue === queues.connecting && options.host[retries + 1])
       return
 
+    unran(err)
     errored(err)
     while (sent.length)
       queryError(sent.shift(), err)
@@ -503,6 +505,44 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     stream && (stream.destroy(err), stream = null)
     query && queryError(query, err)
     initial && (queryError(initial, err), initial = null)
+  }
+
+  // Postgres ends an idle session with 57P05 (idle_session_timeout) only while
+  // nothing is in flight on it. A statement answered with it was written after
+  // the server had already ended the session - a process frozen past the
+  // timeout (a laptop's sleep, a serverless thaw) writes its first statement
+  // to the reaped connection - so it never ran. Outside a reserved scope
+  // (begin, reserve: the session, and its transaction or state, are gone with
+  // it) each such statement goes back to the pool once, for a fresh
+  // connection, instead of failing. A cursor is left to fail, and so is a
+  // statement already sent again. They are handed over once the socket is
+  // gone (resend), never to this connection.
+  function unran(err) {
+    if (!onresend || !err || err.code !== '57P05' || connection.reserved || stream)
+      return
+
+    query && resendable(query) && (again.push(query), query = null)
+    for (let i = sent.length; i > 0; i--) {
+      const q = sent.shift()
+      resendable(q) ? again.push(q) : sent.push(q)
+    }
+  }
+
+  function resendable(q) {
+    return !q.resent && !q.cursorFn && !q.cancelled
+  }
+
+  function resend() {
+    const xs = again
+    again = []
+    xs.forEach(q => {
+      q.resent = true
+      // Rebuilt from its arguments: Bind serialized the parameters in place.
+      q.parameters = null
+      q.bound = false
+      q.active = false
+      onresend(q)
+    })
   }
 
   function queryError(query, err) {
@@ -568,6 +608,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     // spares so that the next host can be tried - a query already sent can't be.
     if (!initial && (query || sent.length)) {
       const err = errorResponse || lostError || Errors.connection('CONNECTION_CLOSED', options, socket)
+      unran(err)
       errored(err)
       while (sent.length)
         queryError(sent.shift(), err)
@@ -583,12 +624,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     rows = 0
 
     if (initial)
-      return reconnect()
+      return (resend(), reconnect())
 
     closedTime = now()
     hadError && options.shared.retries++
     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
     onclose(connection, idleFatal || Errors.connection('CONNECTION_CLOSED', options, socket))
+    // After onclose: the pool has moved this connection out of `busy`, so
+    // none of them can be pipelined back onto the socket that is gone.
+    resend()
     // An end() awaited while this connection was still connecting (or busy)
     // is only ever settled by terminate(); a socket that dies with nothing
     // left to do must settle it too, or sql.end() hangs forever.

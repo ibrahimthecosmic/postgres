@@ -64,7 +64,7 @@ function Postgres(a, b) {
       , full = Queue()
       , queues = { connecting, reserved, closed, ended, open, busy, full }
 
-  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onending }))
+  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onending, onresend: handler }))
 
   const sql = Sql(handler)
 

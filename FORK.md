@@ -282,3 +282,22 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   reads the server's goodbye. Outside a reserved scope (`begin`, `reserve`: the session and
   its state went with it) each such statement goes back to the pool once, for a fresh
   connection. A cursor, and a statement already sent again, fail with the error as before.
+- **A cancel never reaches the next statement on its connection** (3.8.16). A
+  CancelRequest is a second connection to the postmaster, and the signal it makes the
+  server send lands whenever it gets there: the statement it was for has often finished
+  by then, and the connection was already running the next borrower's statement, which
+  the signal cancelled. A connection with a CancelRequest in flight now sends nothing
+  more until that request's socket has closed (the backend is signalled by then, and an
+  idle backend discards a late signal); one still open after `cancel_timeout` loses the
+  connection. Nothing is pipelined behind a `cancellable()` statement either: written
+  before its cancel existed, a statement queued behind it was what a late signal hit.
+- **A transaction that cannot end cleanly closes its connection** (3.8.16). A COMMIT or
+  ROLLBACK that fails at its start (cancelled, say) leaves the session in its
+  transaction, aborted. `begin` kept such a connection reserved for good (a lost pool
+  slot, and an `end()` that never returned); a `reserve()`d one released in a
+  transaction went back to the pool, where every later statement failed `25P02`. Both
+  close the connection now, and the server rolls the transaction back.
+- **A `reserve()` waiting when a connection closes gets the reopened one** (3.8.16): the
+  reconnect took it off the queue it is resolved from, and it never resolved.
+- **The stream's reconnect backoff is bounded** (3.8.16): `50 << attempt` overflowed
+  past attempt 25 (negative, then zero delays, with a `TimeoutNegativeWarning`).

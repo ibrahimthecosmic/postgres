@@ -266,6 +266,16 @@ function Postgres(a, b) {
       // connection may already serve another reserve(), whose onclose stays.
       done = fail(queries, Errors.generic('TRANSACTION_ENDED', 'this transaction already ended; begin() another'))
       connection && connection.onclose === onclose && (connection.onclose = null)
+      // The scope ended but the session is still in a transaction: its COMMIT
+      // or ROLLBACK failed (cancelled at its start, say), leaving it aborted.
+      // Kept reserved, the connection was lost to the pool for good, and end()
+      // hung on it; closed, the server rolls the transaction back for certain.
+      // Still ours: a connection whose last answer was not idle was never
+      // handed back.
+      connection && !lost && connection.queue === reserved && connection.inTransaction() && (
+        connection.reserved = null,
+        connection.terminate()
+      )
     }
 
     async function scope(c, fn, name) {
@@ -400,7 +410,9 @@ function Postgres(a, b) {
     // A cancellable query is never written behind another one: pipelined, it
     // is on the wire but not active, and cancel() could only mark it - the
     // CancelRequest would go out once the statement ahead of it finished.
-    // Queued in the pool it is simply dequeued.
+    // Queued in the pool it is simply dequeued. Nor is anything written
+    // behind one (a connection running it is full, never busy): a cancel can
+    // reach the server after it finished, and would hit what followed.
     busy.length && !query.options.cancellable
       ? go(busy.shift(), query)
       : queries.push(query)
@@ -416,7 +428,7 @@ function Postgres(a, b) {
     return new Promise((resolve, reject) => {
       query.state
         ? query.active
-          ? (Connection(options).cancel(query.state, resolve, reject), query.connection.unanswered(query))
+          ? (query.connection.cancelling(query, resolve, reject), query.connection.unanswered(query))
           : query.cancelled = { resolve, reject }
         : (
           queries.remove(query),
@@ -532,7 +544,10 @@ function Postgres(a, b) {
     if (!queries.length)
       return
 
-    connect(c, queries.shift())
+    // A waiting reserve() stays queued: onopen hands it the connection once
+    // that is ready, as reserve() itself arranges. Shifted off as the
+    // reconnect's initial query, it was never resolved.
+    connect(c, queries.peek().reserve ? queries.peek() : queries.shift())
     // Reopened while the pool ends (its socket died with work queued): it
     // serves that work, then ends like the rest.
     ending && c.end()

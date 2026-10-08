@@ -6,6 +6,7 @@ import fs from 'fs'
 import crypto from 'crypto'
 
 import postgres from '../src/index.js'
+import { reconnectDelay } from '../src/subscribe.js'
 const delay = ms => new Promise(r => setTimeout(r, ms))
 
 const rel = x => new URL(x, import.meta.url)
@@ -4362,4 +4363,113 @@ t('subscribe reports how long its stream has been quiet, keepalives included', {
   await sql.end()
   await stream.end({ timeout: 0 })
   return [true, typeof first === 'number' && first >= 0 && most < 500]
+})
+
+// A socket to the test server whose outgoing chunks pass through `rewrite`,
+// opened after `wait` ms - for the n-th connection the pool, or a
+// CancelRequest, opens.
+const through = ({ rewrite = x => x, wait = () => 0 } = {}) => {
+  let n = 0
+  return async() => {
+    const ms = wait(n++)
+    ms && await delay(ms)
+    return new Promise((resolve, reject) => {
+      const socket = net.connect(Number(process.env.PGPORT || 5432), process.env.PGHOST || 'localhost') // eslint-disable-line
+      const write = socket.write.bind(socket)
+      socket.write = (chunk, ...rest) => write(rewrite(chunk), ...rest)
+      socket.on('error', reject)
+      socket.on('connect', () => resolve(socket))
+    })
+  }
+}
+
+// A simple Query message: what a rewriting socket sends instead.
+const simpleQuery = text => {
+  const body = Buffer.from(text + '\0')
+  const head = Buffer.alloc(5)
+  head[0] = 81 // Q
+  head.writeInt32BE(body.length + 4, 1)
+  return Buffer.concat([head, body])
+}
+
+t('A CancelRequest still in flight does not cancel the next statement on its connection', { timeout: 5 }, async() => {
+  // Every connection after the pool's one is a CancelRequest, and it reaches
+  // the server late: after the statement it was for finished on its own. The
+  // next statement on the connection waits for it to land; sent at once, it
+  // was the one the late signal cancelled.
+  const sql = postgres({ ...options, socket: through({ wait: n => n > 0 && 300 }) })
+  await sql`select 1`
+  const first = sql`select pg_sleep(0.05)`
+  first.execute()
+  await delay(20)
+  const cancelling = first.cancel()
+  await first
+  const next = await sql`select pg_sleep(0.5), 1 as x`.then(x => x[0].x, e => e.code)
+  await cancelling
+  return [1, next, await sql.end()]
+})
+
+t('A statement held behind a CancelRequest and cancelled itself leaves the connection usable', { timeout: 5 }, async() => {
+  const sql = postgres({ ...options, socket: through({ wait: n => n > 0 && 200 }) })
+  await sql`select 1`
+  const first = sql`select pg_sleep(0.05)`
+  first.execute()
+  await delay(20)
+  const cancelling = first.cancel()
+  await first
+  const held = sql`select 2`
+  held.execute()
+  await delay(20)
+  await held.cancel()
+  const error = await held.catch(e => e.code)
+  await cancelling
+  return ['57014 3', error + ' ' + (await sql`select 3 as x`)[0].x, await sql.end()]
+})
+
+t('A COMMIT that leaves its transaction aborted closes the connection', { timeout: 5 }, async() => {
+  // The COMMIT is swapped on the wire for a statement that cancels itself: a
+  // cancel that lands at the start of COMMIT does the same - 57014, and the
+  // session left in its transaction, aborted. Kept reserved, the pool of one
+  // never served again; closed, the server rolls the insert back.
+  let armed = false
+  const sql = postgres({
+    ...options,
+    socket: through({
+      rewrite: x => armed && x.includes('commit\0')
+        ? (armed = false, simpleQuery('select pg_cancel_backend(pg_backend_pid())'))
+        : x
+    })
+  })
+  await sql`create table test (x int)`
+  armed = true
+  const error = await sql.begin(sql => sql`insert into test values (1)`).catch(e => e.code)
+  const [{ n }] = await sql.begin(sql => sql`select count(*)::int as n from test`)
+  await sql`drop table test`
+  return ['57014 0', error + ' ' + n, await sql.end()]
+})
+
+t('A reserved connection released inside a transaction is closed, not pooled', async() => {
+  const sql = postgres(options)
+  const reserved = await sql.reserve()
+  await reserved`begin`
+  await reserved`select 1/0`.catch(() => { /* noop */ })
+  reserved.release()
+  return [1, (await sql`select 1 as x`)[0].x, await sql.end()]
+})
+
+t('The stream reconnect backoff stays within its ceiling', async() => {
+  const delays = Array.from({ length: 64 }, (_, i) => reconnectDelay(i))
+  return ['50 1000 1000', delays[0] + ' ' + Math.min(...delays.slice(5)) + ' ' + Math.max(...delays)]
+})
+
+t('A reserve() waiting when a connection closes gets the reopened one', { timeout: 5 }, async() => {
+  const sql = postgres(options)
+  const first = await sql.reserve()
+  const second = sql.reserve()
+  await delay(20)
+  await first`select pg_terminate_backend(pg_backend_pid())`.catch(() => { /* noop */ })
+  const reserved = await second
+  const [{ x }] = await reserved`select 1 as x`
+  reserved.release()
+  return [1, x, await sql.end()]
 })

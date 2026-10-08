@@ -4,6 +4,14 @@ import { setTimeout, clearTimeout, setInterval, clearInterval, wallNow, now } fr
 
 const noop = () => { /* noop */ }
 
+// The wait before reconnect attempt `attempt`: 50 ms doubling to a 1 s
+// ceiling. The shift is bounded too - unbounded, 50 << 26 overflowed to a
+// negative delay and 50 << 31 to 0, so a stream down for longer than ~25 s
+// retried four times at once in every 32 attempts.
+export function reconnectDelay(attempt) {
+  return Math.min(1000, 50 << Math.min(attempt, 5))
+}
+
 export default function Subscribe(postgres, options) {
   const subscribers = new Map()
       , state = {}
@@ -104,7 +112,7 @@ export default function Subscribe(postgres, options) {
           break
         } catch (error) {
           subscribers.forEach(event => event.forEach(({ onerror }) => onerror(error)))
-          await new Promise(r => setTimeout(r, Math.min(1000, 50 << attempt)))
+          await new Promise(r => setTimeout(r, reconnectDelay(attempt)))
         }
       }
     } finally {

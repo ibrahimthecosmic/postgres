@@ -91,6 +91,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   } = options
 
   const sent = Queue()
+      , cancels = new Set()
       , id = uid++
       , backend = { pid: null, secret: null }
       , idleTimer = timer(end, options.idle_timeout)
@@ -131,6 +132,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     , lostError = null
     , final = null
     , again = []
+    , status = 73
+    , held = []
 
   const connection = {
     queue: queues.closed,
@@ -142,8 +145,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     terminate,
     execute,
     cancel,
+    cancelling,
     lose,
     unanswered,
+    inTransaction: () => status !== 73,
     end,
     ref,
     release,
@@ -187,6 +192,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   // flight, its ReadyForQuery does the same.
   function release() {
     connection.reserved = null
+    // Handed back inside a transaction - a COMMIT or ROLLBACK that failed
+    // (cancelled at its start, say) leaves the session in one, aborted - the
+    // next borrower's every statement would run in it, or fail 25P02. Closed,
+    // the server rolls it back for certain; the pool opens a fresh one.
+    if (!query && !sent.length && !held.length && status !== 73)
+      return terminate()
     if (!ending)
       return onopen(connection)
     query || sent.length || onending(connection) || terminate()
@@ -212,6 +223,45 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       return
     lostError = error
     socket.destroy()
+  }
+
+  // Send a CancelRequest for q, running on this connection, and run nothing
+  // more on it until the request's socket has closed. The CancelRequest is a
+  // second connection to the postmaster, and the signal it makes the server
+  // send is delivered whenever it gets there: q's caller has usually given
+  // up on q already and the connection gone back to the pool, so a signal
+  // still in flight cancelled the next borrower's statement instead. By the
+  // time the postmaster closes that socket it has signalled the backend, and
+  // a backend that is idle when the signal lands discards it. A request still
+  // open cancel_timeout seconds later is on a server that stopped answering:
+  // the connection is lost rather than reused.
+  function cancelling(q, resolve, reject) {
+    const token = {}
+        , seconds = options.cancel_timeout
+        , timer = seconds && setTimeout(() => {
+          cancels.delete(token) && lose(Errors.connection('CONNECTION_CLOSED', options, socket || undefined))
+        }, seconds * 1000)
+    timer && timer.unref && timer.unref()
+    cancels.add(token)
+    Connection(options).cancel(q.state, x => (settled(), resolve(x)), x => (settled(), reject(x)))
+
+    function settled() {
+      clearTimeout(timer)
+      cancels.delete(token) && !cancels.size && flush()
+    }
+  }
+
+  // The statements held while a CancelRequest was in flight, now sent in the
+  // order they came. When none is left to send - each was cancelled while it
+  // waited - and nothing else is outstanding, the connection is ready again:
+  // the ReadyForQuery that would have said so was deferred while they waited.
+  function flush() {
+    if (!held.length)
+      return
+    const xs = held
+    held = []
+    xs.forEach(q => q.cancelled || execute(q))
+    query || sent.length || held.length || ready()
   }
 
   // A CancelRequest went out for q, running on this connection. A server that
@@ -244,6 +294,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (q.cancelled)
       return
 
+    // A CancelRequest is in flight on this connection: q waits for it to land
+    // (cancelling), and the connection takes nothing more until then.
+    if (cancels.size)
+      return held.push(q), false
+
     try {
       q.state = backend
       query
@@ -251,9 +306,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         : (query = q, start(query))
 
       build(q)
+      // Nothing is pipelined behind a cancellable statement either: written
+      // before its CancelRequest, a statement queued behind it was what the
+      // signal hit when the cancelled one had already finished.
       return write(toBuffer(q))
         && !q.describeFirst
         && !q.cursorFn
+        && !q.options.cancellable
         && sent.length < max_pipeline
         && (!q.options.onexecute || q.options.onexecute(connection))
     } catch (error) {
@@ -500,6 +559,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     errored(err)
     while (sent.length)
       queryError(sent.shift(), err)
+    failHeld(err)
+  }
+
+  // The statements held behind a CancelRequest never reached the server; the
+  // connection they waited for is gone.
+  function failHeld(err) {
+    const xs = held
+    held = []
+    cancels.clear()
+    xs.forEach(q => queryError(q, err))
   }
 
   function errored(err) {
@@ -566,7 +635,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   function end() {
     return ending || (
       !connection.reserved && onend(connection),
-      !connection.reserved && !initial && !query && sent.length === 0
+      !connection.reserved && !initial && !query && sent.length === 0 && !held.length
         ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
         : ending = new Promise(r => ended = r)
     )
@@ -574,7 +643,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
 
   function terminate() {
     terminated = true
-    if (stream || query || initial || sent.length)
+    if (stream || query || initial || sent.length || held.length)
       error(Errors.connection('CONNECTION_DESTROYED', options))
 
     clearImmediate(nextWriteTimer)
@@ -614,6 +683,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       while (sent.length)
         queryError(sent.shift(), err)
     }
+    failHeld(lostError || Errors.connection('CONNECTION_CLOSED', options, socket))
 
     // The rest of the socket's state dies with it. Kept, the reopened socket's
     // first ReadyForQuery hands the dead one's error, or its query, to the next
@@ -623,6 +693,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     query = results = errorResponse = lostError = null
     result = new Result()
     rows = 0
+    status = 73
 
     if (initial)
       return (resend(), reconnect())
@@ -716,6 +787,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function ReadyForQuery(x) {
+    status = x[5]
     if (query) {
       if (errorResponse) {
         query.guessed && !query.bound && described(options).delete(query.described)
@@ -771,15 +843,23 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     }
 
     while (sent.length && (query = sent.shift()) && (start(query), query.cancelled)) {
-      Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
+      cancelling(query, query.cancelled.resolve, query.cancelled.reject)
       unanswered(query)
     }
 
-    if (query)
+    // Statements held behind a CancelRequest are this connection's still:
+    // it is ready once they have run (flush).
+    if (query || held.length)
       return // Consider opening if able and sent.length < 50
 
+    ready()
+  }
+
+  // Nothing outstanding: the connection goes back to its reserved scope, or
+  // to the pool.
+  function ready() {
     connection.reserved
-      ? !connection.reserved.release && x[5] === 73 // I
+      ? !connection.reserved.release && status === 73 // I
         ? ending
           ? terminate()
           : (connection.reserved = null, onopen(connection))

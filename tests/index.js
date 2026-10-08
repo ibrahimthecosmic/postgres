@@ -4473,3 +4473,27 @@ t('A reserve() waiting when a connection closes gets the reopened one', { timeou
   reserved.release()
   return [1, x, await sql.end()]
 })
+
+t('A subscribe that fails is retried by the next one, not replayed', { timeout: 10 }, async() => {
+  const sql = postgres({ database: 'postgres_js_test' })
+  const stream = postgres({ database: 'postgres_js_test', publications: 'alltables', fetch_types: false })
+  await sql.unsafe('create publication alltables for all tables')
+  // Every free slot taken by another consumer: CREATE_REPLICATION_SLOT
+  // fails 53400 - an ERROR, so the replication connection stays open and
+  // nothing re-establishes.
+  const [{ max }] = await sql`select current_setting('max_replication_slots')::int as max`
+  const [{ used }] = await sql`select count(*)::int as used from pg_replication_slots`
+  const taken = Array.from({ length: max - used }, (_, i) => 'pgjs_taken_' + i)
+  for (const name of taken)
+    await sql`select pg_create_logical_replication_slot(${ name }, 'pgoutput')`
+  const failed = await stream.subscribe('transaction', () => { /* noop */ }).then(() => 'subscribed', e => e.code)
+  await sql`select pg_drop_replication_slot(${ taken.pop() })`
+  const handle = await stream.subscribe('transaction', () => { /* noop */ })
+  handle.unsubscribe()
+  await stream.end({ timeout: 0 })
+  for (const name of taken)
+    await sql`select pg_drop_replication_slot(${ name })`
+  await sql`drop publication alltables`
+  await sql.end()
+  return ['53400 true', failed + ' ' + (typeof handle.unsubscribe === 'function')]
+})

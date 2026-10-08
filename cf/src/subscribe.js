@@ -29,6 +29,7 @@ export default function Subscribe(postgres, options) {
     , slot = options.slot || 'postgresjs_' + Math.random().toString(36).slice(2)
     , ended = false
     , reconnecting = false
+    , establishing = null
 
   const sql = subscribe.sql = postgres({
     ...options,
@@ -99,8 +100,18 @@ export default function Subscribe(postgres, options) {
     reconnecting = true
     stream = null
     state.pid = state.secret = undefined
+    // A subscribe() that arrives meanwhile waits for this stream instead of
+    // starting a second one on the same replication connection.
+    let established
+    establishing = new Promise((resolve, reject) => established = { resolve, reject })
+    establishing.catch(noop)
     try {
       for (let attempt = 0; !ended; attempt++) {
+        // A subscribe() brought a stream up meanwhile.
+        if (stream) {
+          connection.then(established.resolve, established.reject)
+          break
+        }
         try {
           durable || (slot = 'postgresjs_' + Math.random().toString(36).slice(2))
           const x = await init(sql, slot, options.publications)
@@ -108,6 +119,7 @@ export default function Subscribe(postgres, options) {
           // live stream, or they would re-install the one that just closed.
           connection = Promise.resolve(x)
           connected(x)
+          established.resolve(x)
           subscribers.forEach(event => event.forEach(({ onsubscribe }) => onsubscribe(info())))
           break
         } catch (error) {
@@ -117,6 +129,8 @@ export default function Subscribe(postgres, options) {
       }
     } finally {
       reconnecting = false
+      establishing = null
+      established.reject(Errors.connection('CONNECTION_ENDED', options, options))
     }
   }
 
@@ -126,9 +140,10 @@ export default function Subscribe(postgres, options) {
     durable && validateSlot(slot)
 
     if (!connection)
-      connection = init(sql, slot, options.publications)
+      connection = establishing || init(sql, slot, options.publications)
 
-    const subscriber = { fn, onsubscribe, onerror }
+    const pending = connection
+        , subscriber = { fn, onsubscribe, onerror }
     const fns = subscribers.has(event)
       ? subscribers.get(event).add(subscriber)
       : subscribers.set(event, new Set([subscriber])).get(event)
@@ -147,6 +162,15 @@ export default function Subscribe(postgres, options) {
         get position() { return position ? position() : null },
         get quietMs() { return quiet ? quiet() : null }
       }
+    }, error => {
+      // The stream did not come up - all replication slots in use (53400),
+      // say. Nothing is left behind: this subscriber is on no stream, and
+      // the next subscribe() tries again rather than replaying this failure.
+      // Kept, the rejection was every later subscribe's answer, and nothing
+      // ever retried: the replication connection had not closed.
+      unsubscribe()
+      connection === pending && (connection = null)
+      throw error
     })
   }
 

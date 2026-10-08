@@ -301,3 +301,10 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   reconnect took it off the queue it is resolved from, and it never resolved.
 - **The stream's reconnect backoff is bounded** (3.8.16): `50 << attempt` overflowed
   past attempt 25 (negative, then zero delays, with a `TimeoutNegativeWarning`).
+- **A `subscribe()` that fails leaves nothing behind** (3.8.17). Its first stream start
+  failing (every replication slot in use, `53400`, say) left the rejection cached as the
+  stream, so every later `subscribe()` got the same failure without trying, and the
+  subscriber registered on a stream that never came: nothing retried, since the
+  replication connection had not closed. Now the subscriber is removed and the next
+  `subscribe()` starts the stream again; one that arrives while a lost replication
+  connection is being re-established waits for that attempt instead of starting a second.

@@ -1,3 +1,12 @@
+> **This is a fork of [porsager/postgres](https://github.com/porsager/postgres),
+> maintained for [cosmo](https://github.com/ibrahimthecosmic/cosmo)**, a
+> type-first Postgres ORM. It adds one logical-replication event per database
+> transaction (`sql.subscribe('transaction')`), durable replication slots, and
+> fixes found while building cosmo; per-row subscribe events are disabled.
+> [FORK.md](FORK.md) lists every difference and how the fork tracks upstream.
+> For general use, prefer upstream — `npm install postgres` installs upstream,
+> not this fork. The rest of this page is upstream's README.
+
 <img align="left" width="440" height="180" alt="Fastest full PostgreSQL nodejs client" src="https://raw.githubusercontent.com/porsager/postgres/master/postgresjs.svg?sanitize=true">
 
 - [🚀 Fastest full-featured node & deno client](https://github.com/porsager/postgres-benchmarks#results)

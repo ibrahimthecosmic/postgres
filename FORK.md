@@ -308,3 +308,10 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   replication connection had not closed. Now the subscriber is removed and the next
   `subscribe()` starts the stream again; one that arrives while a lost replication
   connection is being re-established waits for that attempt instead of starting a second.
+- **A statement issued during a COPY waits for it** (3.8.18). Upstream refuses one that
+  reaches a connection in COPY mode (`COPY_IN_PROGRESS`), and one written after the
+  `COPY` statement but before the server answered it landed inside the copy and failed
+  it. A `COPY` (`writable()` / `readable()`) now marks its connection full, as a
+  cancellable statement does: the pool, or a `begin` / `reserve` scope, queues what comes
+  next, and runs it once the COPY's `ReadyForQuery` frees the connection — so statements
+  beside a streamed write in one transaction run in the order they came (cosmo B408).

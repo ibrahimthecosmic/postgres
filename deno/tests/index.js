@@ -4005,16 +4005,47 @@ t('Ensure reserve on query throws proper error', async() => {
   ]
 })
 
-t('query during copy error', async() => {
+t('A query during a copy waits for it to end', async() => {
   const sql = postgres(options) // eslint-disable-line
   await sql`create table test (id serial primary key, name text)`
   const copy = await sql`copy test from stdin`.writable()
-  const error = await sql`select 1`.catch(e => e)
-  await copy.end()
+  let settled = false
+  const after = sql`select count(*)::int as n from test`.then(x => (settled = true, x))
+  copy.write('1\tone\n')
+  await delay(50)
+  const waited = !settled
+  await new Promise(r => copy.end(r))
+  const [{ n }] = await after
 
   return [
-    'COPY_IN_PROGRESS', error.code,
+    'true 1', waited + ' ' + n,
     await sql`drop table test`
+  ]
+})
+
+t('A transaction runs its statements around a copy, in the order they came', async() => {
+  const sql = postgres({ ...options, max: 2 })
+  await sql`create table test (id int)`
+  const [counts, written] = await sql.begin(async sql => {
+    const copy = await sql`copy test from stdin`.writable()
+    // Issued while the copy runs (a query dispatches on its first then):
+    // queued behind it, never written into it.
+    const counts = Promise.all([sql`select count(*)::int as n from test`, sql`select 1 as x`])
+    copy.write('1\n2\n')
+    await delay(20)
+    await new Promise(r => copy.end(r))
+    // And another copy right behind the first, with a statement beside it.
+    const second = await sql`copy test from stdin`.writable()
+    const written = sql`select count(*)::int as n from test`.then(x => x)
+    second.write('3\n')
+    await new Promise(r => second.end(r))
+    return [await counts, await written]
+  })
+
+  return [
+    '2 1 3', counts[0][0].n + ' ' + counts[1][0].x + ' ' + written[0].n,
+    await sql`drop table test`,
+    await sql.end()
   ]
 })
 

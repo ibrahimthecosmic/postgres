@@ -309,11 +309,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       build(q)
       // Nothing is pipelined behind a cancellable statement either: written
       // before its CancelRequest, a statement queued behind it was what the
-      // signal hit when the cancelled one had already finished.
+      // signal hit when the cancelled one had already finished. Nor behind a
+      // COPY (writable/readable): the server reads nothing but copy data
+      // until it ends, so a statement written meanwhile failed it - and one
+      // arriving once it had started was refused. Queued in the pool or the
+      // reserved scope instead, it runs when the COPY's ReadyForQuery frees
+      // the connection.
       return write(toBuffer(q))
         && !q.describeFirst
         && !q.cursorFn
         && !q.options.cancellable
+        && !q.streaming
         && sent.length < max_pipeline
         && (!q.options.onexecute || q.options.onexecute(connection))
     } catch (error) {

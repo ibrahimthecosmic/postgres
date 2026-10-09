@@ -1436,7 +1436,7 @@ This error is thrown if the startup phase of the connection (tcp, protocol negot
 ##### COPY_IN_PROGRESS
 > You cannot execute queries during copy
 
-This error is thrown if trying to run a query during a copy operation (writable / readable).
+A query issued while a copy operation (writable / readable) runs on its connection waits for the copy to end (the pool, or a `begin` / `reserve` scope, queues it), so this error is only reached by a query handed straight to a connection mid-copy.
 
 ## TypeScript support
 

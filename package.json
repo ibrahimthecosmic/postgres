@@ -1,6 +1,6 @@
 {
   "name": "postgres",
-  "version": "3.8.18",
+  "version": "3.8.19",
   "description": "Fastest full featured PostgreSQL client for Node.js",
   "type": "module",
   "module": "src/index.js",

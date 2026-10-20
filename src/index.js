@@ -208,7 +208,9 @@ function Postgres(a, b) {
     const c = open.length
       ? open.shift()
       : await new Promise((resolve, reject) => {
-        const query = { reserve: resolve, reject }
+        // A failed connect rejects the reserve() it was opened for, which must then leave the
+        // queue: left waiting there, every close reconnected for it, forever, after end() too.
+        const query = { reserve: resolve, reject: e => (queries.remove(query), reject(e)) }
         queries.push(query)
         closed.length && connect(closed.shift(), query)
       })

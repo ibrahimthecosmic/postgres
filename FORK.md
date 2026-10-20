@@ -315,3 +315,9 @@ pnpm add postgres@npm:@<owner>/postgres@3.8.5
   cancellable statement does: the pool, or a `begin` / `reserve` scope, queues what comes
   next, and runs it once the COPY's `ReadyForQuery` frees the connection — so statements
   beside a streamed write in one transaction run in the order they came (cosmo B408).
+- **A `reserve()` whose connect fails leaves nothing reconnecting** (3.8.19). Its request
+  waits in the pool's queue and goes to the connection it opens as that connection's first
+  query. A failed connect rejected it there but left it in the queue, so every close
+  reconnected for it: forever, after `end()` too, and the process never exited (a worker
+  started before Postgres hung, alive and never ready). The rejection now takes it off the
+  queue.

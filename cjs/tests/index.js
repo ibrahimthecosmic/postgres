@@ -4528,3 +4528,16 @@ t('A subscribe that fails is retried by the next one, not replayed', { timeout: 
   await sql.end()
   return ['53400 true', failed + ' ' + (typeof handle.unsubscribe === 'function')]
 })
+
+t('A reserve() whose connect fails leaves nothing reconnecting', { timeout: 5 }, async() => {
+  // Its query stayed in the pool's queue after the rejection, so every close
+  // reconnected for it - after end() too, and the process never exited.
+  let closes = 0
+  const sql = postgres({ ...options, port: 1, max: 1, onclose: () => closes++ })
+  const code = await sql.reserve().then(() => 'reserved', e => e.code)
+  await sql.end()
+  await delay(100) // the refused socket's own close
+  const after = closes
+  await delay(500)
+  return ['ECONNREFUSED 0', code + ' ' + (closes - after)]
+})
